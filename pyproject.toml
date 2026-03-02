@@ -1,0 +1,47 @@
+[project]
+name = "science-bot"
+version = "0.1.0"
+description = "AI-powered life science dataset analysis agent."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "openai>=2.24.0",
+    "pandas>=2.3.3",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.1.1",
+    "scipy>=1.15.3",
+    "statsmodels>=0.14.6",
+    "xlrd>=2.0.2",
+]
+
+[project.scripts]
+science-bot = "science_bot.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-dir]
+"" = "science-bot"
+
+[tool.setuptools.packages.find]
+include = ["science_bot*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+fixable = ["ALL"]
+
+[tool.pytest.ini_options]
+testpaths = ["science-bot/tests"]
+python_files = ["test_*.py"]
+
+[tool.ty.src]
+exclude = ["tests/"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "ruff>=0.15.4",
+    "ty>=0.0.19",
+]

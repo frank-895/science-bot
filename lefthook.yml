@@ -1,0 +1,20 @@
+pre-commit:
+  parallel: true
+  commands:
+
+    format:
+      run: uv run ruff format .
+      stage_fixed: true
+
+    lint:
+      run: uv run ruff check . --fix
+      stage_fixed: true
+
+    typecheck:
+      run: uv run ty check
+
+pre-push:
+  commands:
+
+    test:
+      run: uv run pytest
