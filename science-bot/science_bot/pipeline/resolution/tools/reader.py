@@ -528,7 +528,6 @@ def _read_csv(
             skiprows=skiprows,
             usecols=usecols,
             nrows=nrows,
-            low_memory=False,
             chunksize=chunksize,
             engine=engine,
         )
@@ -539,6 +538,5 @@ def _read_csv(
         skiprows=skiprows,
         usecols=usecols,
         nrows=nrows,
-        low_memory=False,
         engine=engine,
     )
