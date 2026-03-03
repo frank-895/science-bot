@@ -48,7 +48,15 @@ def test_build_parser_accepts_run_and_benchmark() -> None:
 
     run_args = parser.parse_args(["run", "--question", "What?", "--capsule", "/tmp/x"])
     benchmark_args = parser.parse_args(
-        ["benchmark", "--directory", "/tmp/data", "--csv", "/tmp/benchmark.csv"]
+        [
+            "benchmark",
+            "--directory",
+            "/tmp/data",
+            "--csv",
+            "/tmp/benchmark.csv",
+            "--trace-dir",
+            "/tmp/traces",
+        ]
     )
 
     assert run_args.command == "run"
@@ -57,6 +65,7 @@ def test_build_parser_accepts_run_and_benchmark() -> None:
     assert benchmark_args.command == "benchmark"
     assert benchmark_args.directory == "/tmp/data"
     assert benchmark_args.csv == "/tmp/benchmark.csv"
+    assert benchmark_args.trace_dir == "/tmp/traces"
 
 
 def test_main_run_prints_human_readable_output(
@@ -96,6 +105,50 @@ def test_main_run_prints_human_readable_output(
     assert "Resolution iterations: 3" in output
     assert "Selected files: clinical.csv, metadata.csv" in output
     assert "Execution notes: Execution completed." in output
+
+
+def test_main_run_writes_trace_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    capsule_path = tmp_path / "capsule"
+    capsule_path.mkdir()
+    trace_root = tmp_path / "traces"
+
+    async def fake_run_orchestrator(request: object) -> OrchestratorResult:
+        return OrchestratorResult(
+            question="What?",
+            capsule_path=capsule_path,
+            status="completed",
+            answer="stub-answer",
+            metadata={
+                "classification_family": "aggregate",
+                "resolution_iterations_used": 1,
+                "resolution_selected_files": ["clinical.csv"],
+                "execution_family": "aggregate",
+            },
+            error=None,
+        )
+
+    monkeypatch.setattr(cli, "run_orchestrator", fake_run_orchestrator)
+
+    exit_code = cli.main(
+        [
+            "run",
+            "--question",
+            "What?",
+            "--capsule",
+            str(capsule_path),
+            "--trace-dir",
+            str(trace_root),
+        ]
+    )
+
+    trace_dirs = list(trace_root.glob("run_*"))
+    assert exit_code == 0
+    assert len(trace_dirs) == 1
+    assert (trace_dirs[0] / "events.jsonl").is_file()
+    assert (trace_dirs[0] / "summary.json").is_file()
 
 
 def test_main_run_returns_error_for_missing_capsule(
@@ -347,6 +400,62 @@ def test_run_benchmark_continues_after_row_failure(
     assert any(
         row.question_id == "q2" and row.status == "failed" for row in summary.rows
     )
+
+
+def test_run_benchmark_writes_trace_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    csv_path = tmp_path / "benchmark.csv"
+    extracted_root = tmp_path / "extracted"
+    capsule_path = extracted_root / "row-1" / "CapsuleData-cap-1"
+    capsule_path.mkdir(parents=True)
+    write_benchmark_csv(
+        csv_path,
+        [
+            {
+                "question": "What is one?",
+                "data_folder": "CapsuleFolder-cap-1.zip",
+                "capsule_uuid": "cap-1",
+                "question_id": "q1",
+                "ideal": "answer",
+                "eval_mode": "str_verifier",
+            }
+        ],
+    )
+
+    monkeypatch.setattr(cli, "prepare_benchmark_directory", lambda _: extracted_root)
+
+    async def fake_run_orchestrator(request: object) -> OrchestratorResult:
+        return OrchestratorResult(
+            question="What is one?",
+            capsule_path=capsule_path,
+            status="completed",
+            answer="answer",
+            metadata={
+                "classification_family": "aggregate",
+                "resolution_iterations_used": 1,
+                "resolution_selected_files": ["clinical.csv"],
+            },
+            error=None,
+        )
+
+    monkeypatch.setattr(cli, "run_orchestrator", fake_run_orchestrator)
+    trace_writer = cli.TraceWriter.for_benchmark(tmp_path / "traces")
+
+    summary = asyncio.run(
+        run_benchmark(
+            csv_path=csv_path,
+            benchmark_directory=tmp_path / "capsules",
+            trace_writer=trace_writer,
+        )
+    )
+
+    assert summary.total_rows == 1
+    assert (trace_writer.root_dir / "manifest.json").is_file()
+    assert (trace_writer.root_dir / "summary.json").is_file()
+    assert (trace_writer.root_dir / "q1" / "events.jsonl").is_file()
+    assert (trace_writer.root_dir / "q1" / "summary.json").is_file()
 
 
 def test_main_benchmark_prints_summary(

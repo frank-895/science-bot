@@ -110,6 +110,14 @@ async def run_resolution_agent(
     steps = [summarize_discovery(scratchpad, step_index=1)]
     notes: list[str] = []
     previous_signature: tuple[str, tuple[tuple[str, object], ...]] | None = None
+    if stage_input.trace_writer is not None:
+        stage_input.trace_writer.write_event(
+            event="resolution_discovery",
+            stage="resolution",
+            question=stage_input.question,
+            family=stage_input.classification.family,
+            payload=steps[0].model_dump(mode="python"),
+        )
 
     for iteration in range(MAX_RESOLUTION_ITERATIONS):
         scratchpad.iterations_used = iteration
@@ -125,6 +133,8 @@ async def run_resolution_agent(
                 response_model=_response_model_for_family(
                     stage_input.classification.family
                 ),
+                trace_writer=stage_input.trace_writer,
+                trace_stage="resolution",
             ),
         )
 
@@ -133,6 +143,17 @@ async def run_resolution_agent(
 
         if decision.action != "finalize":
             tool_name, arguments = _decision_to_tool_call(decision)
+            if stage_input.trace_writer is not None:
+                stage_input.trace_writer.write_event(
+                    event="resolution_tool_call",
+                    stage="resolution",
+                    question=stage_input.question,
+                    family=stage_input.classification.family,
+                    payload={
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                    },
+                )
             signature = _tool_signature(tool_name, arguments)
             if signature == previous_signature:
                 raise ResolutionIterationLimitError(
@@ -155,14 +176,21 @@ async def run_resolution_agent(
                 tool_name=tool_name,
                 result=result,
             )
-            steps.append(
-                summarize_tool_result(
-                    tool_name=tool_name,
-                    result=result,
-                    scratchpad=scratchpad,
-                    step_index=len(steps) + 1,
-                )
+            step_summary = summarize_tool_result(
+                tool_name=tool_name,
+                result=result,
+                scratchpad=scratchpad,
+                step_index=len(steps) + 1,
             )
+            steps.append(step_summary)
+            if stage_input.trace_writer is not None:
+                stage_input.trace_writer.write_event(
+                    event="resolution_tool_result",
+                    stage="resolution",
+                    question=stage_input.question,
+                    family=stage_input.classification.family,
+                    payload=step_summary.model_dump(mode="python"),
+                )
             continue
 
         plan = _build_plan_from_decision(decision, stage_input.classification.family)
@@ -171,14 +199,25 @@ async def run_resolution_agent(
             plan=plan,
         )
         notes.extend(extra_notes)
-        steps.append(
-            summarize_finalize(
-                family=stage_input.classification.family,
-                selected_files=selected_files,
-                resolved_field_keys=list(plan.model_dump(exclude_none=True).keys()),
-                step_index=len(steps) + 1,
-            )
+        finalize_step = summarize_finalize(
+            family=stage_input.classification.family,
+            selected_files=selected_files,
+            resolved_field_keys=list(plan.model_dump(exclude_none=True).keys()),
+            step_index=len(steps) + 1,
         )
+        steps.append(finalize_step)
+        if stage_input.trace_writer is not None:
+            stage_input.trace_writer.write_event(
+                event="resolution_finalize",
+                stage="resolution",
+                question=stage_input.question,
+                family=stage_input.classification.family,
+                payload={
+                    "step": finalize_step.model_dump(mode="python"),
+                    "plan": _plan_trace_summary(plan),
+                    "notes": extra_notes,
+                },
+            )
         return ResolutionStageOutput(
             payload=payload,
             iterations_used=iteration + 1,
@@ -534,6 +573,55 @@ def _build_plan_from_decision(
         )
 
     raise ResolutionValidationError(f"Unsupported finalize family: {family}")
+
+
+def _plan_trace_summary(plan: FamilyResolutionPlan) -> dict[str, object]:
+    """Build a lightweight trace summary for a finalized resolution plan."""
+
+    if isinstance(plan, AggregateResolvedPlan):
+        return {
+            "family": plan.family,
+            "filename": plan.filename,
+            "operation": plan.operation,
+            "value_column": plan.value_column,
+            "filter_columns": _filter_columns(plan.filters),
+        }
+    if isinstance(plan, HypothesisTestResolvedPlan):
+        return {
+            "family": plan.family,
+            "filename": plan.filename,
+            "test": plan.test,
+            "value_column": plan.value_column,
+            "group_column": plan.group_column,
+            "return_field": plan.return_field,
+        }
+    if isinstance(plan, RegressionResolvedPlan):
+        return {
+            "family": plan.family,
+            "filename": plan.filename,
+            "model_type": plan.model_type,
+            "outcome_column": plan.outcome_column,
+            "predictor_column": plan.predictor_column,
+            "covariate_columns": plan.covariate_columns,
+            "return_field": plan.return_field,
+        }
+    if isinstance(plan, DifferentialExpressionResolvedPlan):
+        return {
+            "family": plan.family,
+            "mode": plan.mode,
+            "operation": plan.operation,
+            "result_table_files": plan.result_table_files,
+            "comparison_labels": plan.comparison_labels,
+        }
+    return {
+        "family": plan.family,
+        "filename": plan.filename,
+        "operation": plan.operation,
+        "sample_column": plan.sample_column,
+        "gene_column": plan.gene_column,
+        "effect_column": plan.effect_column,
+        "vaf_column": plan.vaf_column,
+    }
 
 
 def _require_value(value: T | None, field_name: str) -> T:

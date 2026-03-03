@@ -25,6 +25,13 @@ from science_bot.pipeline.orchestrator import (
     OrchestratorResult,
     run_orchestrator,
 )
+from science_bot.tracing import (
+    BenchmarkRowTraceSummary,
+    BenchmarkTraceManifest,
+    BenchmarkTraceSummary,
+    RunTraceSummary,
+    TraceWriter,
+)
 
 REQUIRED_BENCHMARK_COLUMNS = frozenset(
     {
@@ -170,10 +177,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("--question", required=True)
     run_parser.add_argument("--capsule", required=True)
+    run_parser.add_argument("--trace-dir", required=False)
 
     benchmark_parser = subparsers.add_parser("benchmark")
     benchmark_parser.add_argument("--directory", required=True)
     benchmark_parser.add_argument("--csv", required=True)
+    benchmark_parser.add_argument("--trace-dir", required=False)
     return parser
 
 
@@ -237,7 +246,8 @@ def resolve_benchmark_capsule_path(
     if not folder_name.startswith("CapsuleFolder-") or not folder_name.endswith(".zip"):
         raise ValueError(f"Unsupported data_folder value: {row.data_folder}")
 
-    benchmark_root = extracted_capsules_root / row.row_id
+    row_id = row.row_id if row.row_id is not None else row.capsule_uuid
+    benchmark_root = extracted_capsules_root / row_id
     if not benchmark_root.is_dir():
         raise FileNotFoundError(f"Capsule directory not found: {benchmark_root}")
 
@@ -438,6 +448,7 @@ def score_benchmark_response(eval_mode: str, ideal: str, response: str) -> bool:
 async def run_benchmark(
     csv_path: Path,
     benchmark_directory: Path,
+    trace_writer: TraceWriter | None = None,
 ) -> BenchmarkSummary:
     """Run the fixed benchmark suite.
 
@@ -453,6 +464,27 @@ async def run_benchmark(
         ValueError: If the benchmark inputs are malformed.
     """
     extracted_capsules_root = prepare_benchmark_directory(benchmark_directory)
+    if trace_writer is not None:
+        trace_writer.write_manifest(
+            BenchmarkTraceManifest(
+                command="benchmark",
+                csv_path=str(csv_path),
+                benchmark_directory=str(benchmark_directory),
+                prepared_capsule_root=str(extracted_capsules_root),
+                trace_root=str(trace_writer.root_dir),
+                started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                concurrency=BENCHMARK_CONCURRENCY,
+            )
+        )
+        trace_writer.write_event(
+            event="benchmark_started",
+            stage="cli",
+            payload={
+                "csv_path": csv_path,
+                "benchmark_directory": benchmark_directory,
+                "prepared_capsule_root": extracted_capsules_root,
+            },
+        )
     rows = load_benchmark_rows(csv_path)
     semaphore = asyncio.Semaphore(BENCHMARK_CONCURRENCY)
     start_time = time.perf_counter()
@@ -467,13 +499,32 @@ async def run_benchmark(
             BenchmarkRowResult: Completed row result.
         """
         async with semaphore:
+            row_trace_writer = (
+                trace_writer.create_row_writer(row.question_id)
+                if trace_writer is not None
+                else None
+            )
+            if row_trace_writer is not None:
+                row_trace_writer.write_event(
+                    event="benchmark_row_started",
+                    stage="cli",
+                    question_id=row.question_id,
+                    question=row.question,
+                    payload={
+                        "row_id": row.row_id,
+                        "capsule_uuid": row.capsule_uuid,
+                        "data_folder": row.data_folder,
+                    },
+                )
             try:
                 capsule_path = resolve_benchmark_capsule_path(
                     row, extracted_capsules_root
                 )
                 orchestrator_result = await run_orchestrator(
                     OrchestratorRequest(
-                        question=row.question, capsule_path=capsule_path
+                        question=row.question,
+                        capsule_path=capsule_path,
+                        trace_writer=row_trace_writer,
                     )
                 )
                 is_correct = score_benchmark_response(
@@ -503,8 +554,34 @@ async def run_benchmark(
                     is_correct=is_correct,
                     status="completed",
                 )
+                if row_trace_writer is not None:
+                    row_trace_writer.write_event(
+                        event="benchmark_row_finished",
+                        stage="cli",
+                        question_id=row.question_id,
+                        question=row.question,
+                        family=orchestrator_result.classification_family,
+                        payload={
+                            "status": orchestrator_result.status,
+                            "is_correct": orchestrator_result.is_correct,
+                            "answer": orchestrator_result.response,
+                        },
+                    )
+                    row_trace_writer.write_summary(
+                        BenchmarkRowTraceSummary(
+                            question_id=row.question_id,
+                            status=orchestrator_result.status,
+                            classification_family=orchestrator_result.classification_family,
+                            resolution_iterations_used=orchestrator_result.resolution_iterations_used,
+                            selected_files=orchestrator_result.selected_files,
+                            answer=orchestrator_result.response,
+                            is_correct=orchestrator_result.is_correct,
+                            error=orchestrator_result.error,
+                        )
+                    )
+                return orchestrator_result
             except Exception as exc:
-                return BenchmarkRowResult(
+                result = BenchmarkRowResult(
                     question_id=row.question_id,
                     question=row.question,
                     capsule_path=None,
@@ -515,6 +592,27 @@ async def run_benchmark(
                     status="failed",
                     error=str(exc),
                 )
+                if row_trace_writer is not None:
+                    row_trace_writer.write_event(
+                        event="benchmark_row_finished",
+                        stage="cli",
+                        question_id=row.question_id,
+                        question=row.question,
+                        payload={
+                            "status": result.status,
+                            "error": result.error,
+                        },
+                    )
+                    row_trace_writer.write_summary(
+                        BenchmarkRowTraceSummary(
+                            question_id=row.question_id,
+                            status=result.status,
+                            error=result.error,
+                            is_correct=result.is_correct,
+                        )
+                    )
+                    row_trace_writer.write_error(exc)
+                return result
 
     row_results = await asyncio.gather(*(run_row(row) for row in rows))
     elapsed_seconds = time.perf_counter() - start_time
@@ -523,7 +621,7 @@ async def run_benchmark(
     correct_rows = sum(result.is_correct for result in row_results)
     incorrect_rows = len(row_results) - correct_rows
     accuracy = correct_rows / len(row_results) if row_results else 0.0
-    return BenchmarkSummary(
+    summary = BenchmarkSummary(
         total_rows=len(row_results),
         completed_rows=completed_rows,
         failed_rows=failed_rows,
@@ -533,6 +631,38 @@ async def run_benchmark(
         elapsed_seconds=elapsed_seconds,
         rows=row_results,
     )
+    if trace_writer is not None:
+        trace_writer.write_event(
+            event="run_finished",
+            stage="cli",
+            payload={
+                "status": "completed",
+                "total_rows": summary.total_rows,
+                "completed_rows": summary.completed_rows,
+                "failed_rows": summary.failed_rows,
+                "accuracy": summary.accuracy,
+            },
+        )
+        trace_writer.write_summary(
+            BenchmarkTraceSummary(
+                total_rows=summary.total_rows,
+                completed_rows=summary.completed_rows,
+                failed_rows=summary.failed_rows,
+                correct_rows=summary.correct_rows,
+                incorrect_rows=summary.incorrect_rows,
+                accuracy=summary.accuracy,
+                elapsed_seconds=summary.elapsed_seconds,
+                rows=[
+                    {
+                        "question_id": row.question_id,
+                        "status": row.status,
+                        "row_trace_dir": str(trace_writer.root_dir / row.question_id),
+                    }
+                    for row in summary.rows
+                ],
+            )
+        )
+    return summary
 
 
 def format_run_output(result: OrchestratorResult) -> str:
@@ -685,30 +815,109 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.command == "run":
+            trace_writer = (
+                TraceWriter.for_run(Path(args.trace_dir).expanduser().resolve())
+                if getattr(args, "trace_dir", None)
+                else None
+            )
             request = OrchestratorRequest(
                 question=args.question,
                 capsule_path=Path(args.capsule).expanduser().resolve(),
+                trace_writer=trace_writer,
             )
+            if trace_writer is not None:
+                trace_writer.write_event(
+                    event="run_started",
+                    stage="cli",
+                    question=request.question,
+                    payload={"capsule_path": request.capsule_path},
+                )
             result = asyncio.run(run_orchestrator(request))
+            if trace_writer is not None:
+                trace_writer.write_event(
+                    event="run_finished",
+                    stage="cli",
+                    question=result.question,
+                    family=_extract_metadata_string(
+                        result.metadata, "classification_family"
+                    ),
+                    payload={
+                        "status": result.status,
+                        "answer": result.answer,
+                    },
+                )
+                trace_writer.write_summary(
+                    RunTraceSummary(
+                        status=result.status,
+                        question=result.question,
+                        capsule_path=str(result.capsule_path),
+                        classification_family=_extract_metadata_string(
+                            result.metadata, "classification_family"
+                        ),
+                        resolution_iterations_used=_extract_metadata_int(
+                            result.metadata,
+                            "resolution_iterations_used",
+                        ),
+                        selected_files=_extract_metadata_str_list(
+                            result.metadata,
+                            "resolution_selected_files",
+                        ),
+                        answer=result.answer,
+                        execution_family=_extract_metadata_string(
+                            result.metadata, "execution_family"
+                        ),
+                        error=result.error,
+                    )
+                )
             print(format_run_output(result))
             return 0
 
         if args.command == "benchmark":
             benchmark_directory = Path(args.directory).expanduser().resolve()
             csv_path = Path(args.csv).expanduser().resolve()
-            print(f"Preparing benchmark data from: {benchmark_directory}")
-            summary = asyncio.run(
-                run_benchmark(
-                    csv_path=csv_path,
-                    benchmark_directory=benchmark_directory,
-                )
+            trace_writer = (
+                TraceWriter.for_benchmark(Path(args.trace_dir).expanduser().resolve())
+                if getattr(args, "trace_dir", None)
+                else None
             )
+            print(f"Preparing benchmark data from: {benchmark_directory}")
+            if trace_writer is None:
+                summary = asyncio.run(
+                    run_benchmark(
+                        csv_path=csv_path,
+                        benchmark_directory=benchmark_directory,
+                    )
+                )
+            else:
+                summary = asyncio.run(
+                    run_benchmark(
+                        csv_path=csv_path,
+                        benchmark_directory=benchmark_directory,
+                        trace_writer=trace_writer,
+                    )
+                )
             print(format_benchmark_output(summary))
             return 0
     except (ValidationError, ValueError, FileNotFoundError) as exc:
+        trace_writer = locals().get("trace_writer")
+        if isinstance(trace_writer, TraceWriter):
+            trace_writer.write_event(
+                event="run_failed",
+                stage="cli",
+                payload={"error": str(exc)},
+            )
+            trace_writer.write_error(exc)
         print(f"Error: {exc}")
         return 1
     except Exception as exc:
+        trace_writer = locals().get("trace_writer")
+        if isinstance(trace_writer, TraceWriter):
+            trace_writer.write_event(
+                event="run_failed",
+                stage="cli",
+                payload={"error": str(exc)},
+            )
+            trace_writer.write_error(exc)
         print(f"Error: {exc}")
         return 1
 

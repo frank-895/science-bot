@@ -1,8 +1,11 @@
 import asyncio
+import json
+from pathlib import Path
 
 import pytest
 from pydantic import BaseModel
 from science_bot.providers import llm
+from science_bot.tracing import TraceWriter
 
 
 class FakeResponseModel(BaseModel):
@@ -125,3 +128,41 @@ def test_parse_structured_returns_parsed_response(
     )
 
     assert result == FakeResponseModel(value="ok")
+
+
+def test_parse_structured_writes_trace_events(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    class FakeResponse:
+        output_parsed = FakeResponseModel(value="ok")
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **_: object) -> None:
+            self.responses = self
+
+        async def parse(self, **_: object) -> FakeResponse:
+            return FakeResponse()
+
+    monkeypatch.setattr(llm, "AsyncOpenAI", FakeAsyncOpenAI)
+    trace_writer = TraceWriter.for_run(tmp_path / "traces")
+
+    asyncio.run(
+        llm.parse_structured(
+            system_prompt="system",
+            user_prompt="user",
+            response_model=FakeResponseModel,
+            trace_writer=trace_writer,
+            trace_stage="classification",
+        )
+    )
+
+    events_path = trace_writer.root_dir / "events.jsonl"
+    events = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert [event["event"] for event in events] == ["llm_request", "llm_response"]

@@ -3,14 +3,16 @@
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from science_bot.pipeline.contracts import QuestionClassification
+from science_bot.tracing import TraceWriter
 
 
 class ClassificationStageInput(BaseModel):
     """Input contract for the classification stage."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     question: str
+    trace_writer: "TraceWriter | None" = None
 
     @field_validator("question")
     @classmethod

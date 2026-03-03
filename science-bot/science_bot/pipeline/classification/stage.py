@@ -63,6 +63,8 @@ async def run_classification_stage(
         system_prompt=CLASSIFICATION_SYSTEM_PROMPT,
         user_prompt=f"Question: {stage_input.question}",
         response_model=ClassificationResponse,
+        trace_writer=stage_input.trace_writer,
+        trace_stage="classification",
     )
     classification = parse_question_classification(
         response.model_dump(exclude_none=True)

@@ -20,6 +20,7 @@ from science_bot.pipeline.contracts import (
     VariantFilteringReturnFormat,
 )
 from science_bot.pipeline.execution.schemas import ExecutionPayload
+from science_bot.tracing import TraceWriter
 
 ResolvedFilterValue: TypeAlias = (
     str | int | float | bool | list[str] | list[int] | list[float]
@@ -62,11 +63,12 @@ class ResolutionStepSummary(BaseModel):
 class ResolutionStageInput(BaseModel):
     """Input contract for the resolution stage."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     question: str
     classification: SupportedQuestionClassification
     capsule_path: Path
+    trace_writer: "TraceWriter | None" = None
 
     @field_validator("question")
     @classmethod

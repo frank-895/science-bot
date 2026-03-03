@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +20,7 @@ from science_bot.pipeline.resolution import (
     ResolutionStageOutput,
     ResolutionStepSummary,
 )
+from science_bot.tracing import TraceWriter
 
 
 def test_orchestrator_runs_all_stages(
@@ -147,3 +149,80 @@ def test_orchestrator_raises_for_unsupported_question(
                 )
             )
         )
+
+
+def test_orchestrator_writes_trace_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capsule_path = tmp_path / "capsule"
+    capsule_path.mkdir()
+    trace_writer = TraceWriter.for_run(tmp_path / "traces")
+
+    async def fake_run_classification_stage(
+        stage_input: object,
+    ) -> ClassificationStageOutput:
+        return ClassificationStageOutput(
+            classification=SupportedQuestionClassification(family="aggregate")
+        )
+
+    async def fake_run_resolution_stage(stage_input: object) -> ResolutionStageOutput:
+        return ResolutionStageOutput(
+            payload=AggregateExecutionInput(
+                family="aggregate",
+                operation="count",
+                data=pd.DataFrame({"value": [1, 2]}),
+                filters=[],
+                return_format="number",
+            ),
+            iterations_used=1,
+            selected_files=["clinical.csv"],
+            notes=[],
+            steps=[],
+        )
+
+    def fake_run_execution_stage(stage_input: object) -> ExecutionStageOutput:
+        return ExecutionStageOutput(
+            family="aggregate",
+            answer="2",
+            raw_result={"value": 2},
+            notes=[],
+        )
+
+    monkeypatch.setattr(
+        "science_bot.pipeline.orchestrator.run_classification_stage",
+        fake_run_classification_stage,
+    )
+    monkeypatch.setattr(
+        "science_bot.pipeline.orchestrator.run_resolution_stage",
+        fake_run_resolution_stage,
+    )
+    monkeypatch.setattr(
+        "science_bot.pipeline.orchestrator.run_execution_stage",
+        fake_run_execution_stage,
+    )
+
+    asyncio.run(
+        run_orchestrator(
+            OrchestratorRequest(
+                question="How many rows?",
+                capsule_path=capsule_path,
+                trace_writer=trace_writer,
+            )
+        )
+    )
+
+    events = [
+        json.loads(line)
+        for line in (trace_writer.root_dir / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [event["event"] for event in events] == [
+        "classification_started",
+        "classification_finished",
+        "resolution_started",
+        "resolution_finished",
+        "execution_started",
+        "execution_finished",
+    ]
