@@ -5,6 +5,7 @@ import asyncio
 import csv
 import re
 import time
+import zipfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
@@ -18,9 +19,6 @@ from science_bot.pipeline.orchestrator import (
     run_orchestrator,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-BENCHMARK_CSV_PATH = REPO_ROOT / "data" / "BixBenchFiltered_50_clean.csv"
-EXTRACTED_CAPSULES_ROOT = REPO_ROOT / "data" / "extracted_capsules"
 REQUIRED_BENCHMARK_COLUMNS = frozenset(
     {"question", "data_folder", "capsule_uuid", "question_id", "ideal", "eval_mode"}
 )
@@ -94,6 +92,19 @@ class BenchmarkSummary(BaseModel):
     rows: list[BenchmarkRowResult] = Field(default_factory=list)
 
 
+def is_ignored_zip_member(member_name: str) -> bool:
+    """Determine whether a zip entry should be skipped during extraction.
+
+    Args:
+        member_name: Raw archive member name.
+
+    Returns:
+        bool: Whether the member should be ignored.
+    """
+    parts = [part for part in Path(member_name).parts if part not in {".", ""}]
+    return any(part == "__MACOSX" or part.startswith("._") for part in parts)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level CLI parser.
 
@@ -107,7 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--question", required=True)
     run_parser.add_argument("--capsule", required=True)
 
-    subparsers.add_parser("benchmark")
+    benchmark_parser = subparsers.add_parser("benchmark")
+    benchmark_parser.add_argument("--directory", required=True)
+    benchmark_parser.add_argument("--csv", required=True)
     return parser
 
 
@@ -187,6 +200,134 @@ def resolve_benchmark_capsule_path(
     raise ValueError(f"Multiple CapsuleData directories found under {benchmark_root}")
 
 
+def is_extracted_capsule_tree(directory_path: Path) -> bool:
+    """Detect whether a directory already contains extracted benchmark capsules.
+
+    Args:
+        directory_path: Candidate benchmark directory.
+
+    Returns:
+        bool: Whether the directory matches the extracted capsule tree shape.
+    """
+    if not directory_path.is_dir():
+        return False
+
+    for child in directory_path.iterdir():
+        if not child.is_dir():
+            continue
+        if any(
+            grandchild.is_dir() and grandchild.name.startswith("CapsuleData-")
+            for grandchild in child.iterdir()
+        ):
+            return True
+    return False
+
+
+def extract_outer_archive(archive_path: Path) -> Path:
+    """Extract the outer capsule archive beside the provided zip file.
+
+    Args:
+        archive_path: Zip archive containing capsule zip files.
+
+    Returns:
+        Path: Directory containing the extracted outer archive content.
+
+    Raises:
+        FileNotFoundError: If the archive does not exist.
+        ValueError: If the path is not a zip archive.
+        zipfile.BadZipFile: If the archive is invalid.
+    """
+    if not archive_path.is_file():
+        raise FileNotFoundError(f"Benchmark directory not found: {archive_path}")
+    if archive_path.suffix.lower() != ".zip":
+        raise ValueError(f"Expected a .zip file: {archive_path}")
+
+    extracted_directory = archive_path.with_suffix("")
+    if extracted_directory.is_dir():
+        return extracted_directory
+
+    extracted_directory.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive_path) as archive:
+        for member in archive.infolist():
+            if is_ignored_zip_member(member.filename):
+                continue
+            archive.extract(member, archive_path.parent)
+    return extracted_directory
+
+
+def extract_inner_capsules(source_directory: Path) -> Path:
+    """Extract inner capsule archives into the benchmark resolver layout.
+
+    Args:
+        source_directory: Directory containing `CapsuleFolder-*.zip` files.
+
+    Returns:
+        Path: Extracted capsule root compatible with benchmark resolution.
+
+    Raises:
+        FileNotFoundError: If the source directory does not exist.
+    """
+    if not source_directory.is_dir():
+        raise FileNotFoundError(f"Benchmark directory not found: {source_directory}")
+
+    extracted_root = source_directory.parent / "extracted_capsules"
+    extracted_root.mkdir(parents=True, exist_ok=True)
+
+    for capsule_zip in sorted(source_directory.glob("CapsuleFolder-*.zip")):
+        capsule_uuid = capsule_zip.stem.removeprefix("CapsuleFolder-")
+        target_directory = extracted_root / capsule_uuid
+        existing_data_directories = [
+            child for child in target_directory.glob("CapsuleData-*") if child.is_dir()
+        ]
+        if existing_data_directories:
+            continue
+
+        target_directory.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(capsule_zip) as archive:
+            for member in archive.infolist():
+                if is_ignored_zip_member(member.filename):
+                    continue
+                archive.extract(member, target_directory)
+
+    return extracted_root
+
+
+def prepare_benchmark_directory(directory_path: Path) -> Path:
+    """Prepare a benchmark directory for row execution.
+
+    Args:
+        directory_path: User-provided benchmark data path.
+
+    Returns:
+        Path: Extracted capsule root in the benchmark resolver layout.
+
+    Raises:
+        FileNotFoundError: If the input path does not exist.
+        ValueError: If the path does not match a supported benchmark shape.
+    """
+    if not directory_path.exists():
+        raise FileNotFoundError(f"Benchmark directory not found: {directory_path}")
+
+    if directory_path.is_file():
+        if directory_path.suffix.lower() != ".zip":
+            raise ValueError(f"Unsupported benchmark directory file: {directory_path}")
+        extracted_directory = extract_outer_archive(directory_path)
+        if is_extracted_capsule_tree(extracted_directory):
+            return extracted_directory
+        return extract_inner_capsules(extracted_directory)
+
+    if is_extracted_capsule_tree(directory_path):
+        return directory_path
+
+    if any(directory_path.glob("CapsuleFolder-*.zip")):
+        return extract_inner_capsules(directory_path)
+
+    raise ValueError(
+        "Unsupported benchmark directory. Provide a zip archive, a directory of "
+        "CapsuleFolder-*.zip files, or an extracted capsule tree."
+    )
+
+
 def normalize_text(value: str) -> str:
     """Normalize text for deterministic comparisons.
 
@@ -238,14 +379,14 @@ def score_benchmark_response(eval_mode: str, ideal: str, response: str) -> bool:
 
 
 async def run_benchmark(
-    csv_path: Path = BENCHMARK_CSV_PATH,
-    extracted_capsules_root: Path = EXTRACTED_CAPSULES_ROOT,
+    csv_path: Path,
+    benchmark_directory: Path,
 ) -> BenchmarkSummary:
     """Run the fixed benchmark suite.
 
     Args:
         csv_path: Benchmark CSV location.
-        extracted_capsules_root: Root directory for extracted capsules.
+        benchmark_directory: User-provided benchmark data location.
 
     Returns:
         BenchmarkSummary: Aggregate benchmark outcomes.
@@ -254,11 +395,7 @@ async def run_benchmark(
         FileNotFoundError: If the benchmark inputs are missing.
         ValueError: If the benchmark inputs are malformed.
     """
-    if not extracted_capsules_root.is_dir():
-        raise FileNotFoundError(
-            f"Extracted capsules root not found: {extracted_capsules_root}"
-        )
-
+    extracted_capsules_root = prepare_benchmark_directory(benchmark_directory)
     rows = load_benchmark_rows(csv_path)
     semaphore = asyncio.Semaphore(BENCHMARK_CONCURRENCY)
     start_time = time.perf_counter()
@@ -402,7 +539,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         if args.command == "benchmark":
-            summary = asyncio.run(run_benchmark())
+            benchmark_directory = Path(args.directory).expanduser().resolve()
+            csv_path = Path(args.csv).expanduser().resolve()
+            print(f"Preparing benchmark data from: {benchmark_directory}")
+            summary = asyncio.run(
+                run_benchmark(
+                    csv_path=csv_path,
+                    benchmark_directory=benchmark_directory,
+                )
+            )
             print(format_benchmark_output(summary))
             return 0
     except (ValidationError, ValueError, FileNotFoundError) as exc:

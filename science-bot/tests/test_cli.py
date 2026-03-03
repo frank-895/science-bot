@@ -1,4 +1,5 @@
 import asyncio
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -6,7 +7,11 @@ from science_bot import cli
 from science_bot.cli import (
     BenchmarkRow,
     BenchmarkSummary,
+    extract_inner_capsules,
+    extract_outer_archive,
+    is_extracted_capsule_tree,
     load_benchmark_rows,
+    prepare_benchmark_directory,
     resolve_benchmark_capsule_path,
     run_benchmark,
     score_benchmark_response,
@@ -42,12 +47,16 @@ def test_build_parser_accepts_run_and_benchmark() -> None:
     parser = cli.build_parser()
 
     run_args = parser.parse_args(["run", "--question", "What?", "--capsule", "/tmp/x"])
-    benchmark_args = parser.parse_args(["benchmark"])
+    benchmark_args = parser.parse_args(
+        ["benchmark", "--directory", "/tmp/data", "--csv", "/tmp/benchmark.csv"]
+    )
 
     assert run_args.command == "run"
     assert run_args.question == "What?"
     assert run_args.capsule == "/tmp/x"
     assert benchmark_args.command == "benchmark"
+    assert benchmark_args.directory == "/tmp/data"
+    assert benchmark_args.csv == "/tmp/benchmark.csv"
 
 
 def test_main_run_prints_human_readable_output(
@@ -160,6 +169,88 @@ def test_resolve_benchmark_capsule_path_rejects_ambiguous_fallback(
         resolve_benchmark_capsule_path(row, root)
 
 
+def test_is_extracted_capsule_tree_detects_expected_layout(tmp_path: Path) -> None:
+    extracted_root = tmp_path / "extracted"
+    (extracted_root / "cap-uuid" / "CapsuleData-inner").mkdir(parents=True)
+
+    assert is_extracted_capsule_tree(extracted_root)
+
+
+def test_extract_outer_archive_uses_adjacent_directory(tmp_path: Path) -> None:
+    archive_path = tmp_path / "capsule_folders.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("__MACOSX/._ignored", "ignored")
+        archive.writestr("capsule_folders/CapsuleFolder-cap-1.zip", "placeholder")
+
+    extracted_directory = extract_outer_archive(archive_path)
+
+    assert extracted_directory == tmp_path / "capsule_folders"
+    assert extracted_directory.is_dir()
+    assert (extracted_directory / "CapsuleFolder-cap-1.zip").is_file()
+    assert not (tmp_path / "__MACOSX").exists()
+
+
+def test_extract_inner_capsules_creates_extracted_capsule_tree(tmp_path: Path) -> None:
+    source_directory = tmp_path / "capsule_folders"
+    source_directory.mkdir()
+    capsule_zip = source_directory / "CapsuleFolder-cap-1.zip"
+    with zipfile.ZipFile(capsule_zip, "w") as archive:
+        archive.writestr("__MACOSX/._ignored", "ignored")
+        archive.writestr("CapsuleData-inner/data.txt", "payload")
+
+    extracted_root = extract_inner_capsules(source_directory)
+
+    assert extracted_root == tmp_path / "extracted_capsules"
+    assert (extracted_root / "cap-1" / "CapsuleData-inner" / "data.txt").is_file()
+    assert not (extracted_root / "cap-1" / "__MACOSX").exists()
+
+
+def test_extract_inner_capsules_reuses_existing_data(tmp_path: Path) -> None:
+    source_directory = tmp_path / "capsule_folders"
+    source_directory.mkdir()
+    capsule_zip = source_directory / "CapsuleFolder-cap-1.zip"
+    with zipfile.ZipFile(capsule_zip, "w") as archive:
+        archive.writestr("CapsuleData-inner/data.txt", "new-payload")
+
+    existing_file = (
+        tmp_path / "extracted_capsules" / "cap-1" / "CapsuleData-existing" / "data.txt"
+    )
+    existing_file.parent.mkdir(parents=True)
+    existing_file.write_text("existing", encoding="utf-8")
+
+    extracted_root = extract_inner_capsules(source_directory)
+
+    assert extracted_root == tmp_path / "extracted_capsules"
+    assert existing_file.read_text(encoding="utf-8") == "existing"
+
+
+def test_prepare_benchmark_directory_accepts_extracted_tree(tmp_path: Path) -> None:
+    extracted_root = tmp_path / "extracted_capsules"
+    (extracted_root / "cap-1" / "CapsuleData-inner").mkdir(parents=True)
+
+    prepared_root = prepare_benchmark_directory(extracted_root)
+
+    assert prepared_root == extracted_root
+
+
+def test_prepare_benchmark_directory_extracts_zip_input(tmp_path: Path) -> None:
+    outer_zip = tmp_path / "capsule_folders.zip"
+    inner_zip_bytes = tmp_path / "inner.zip"
+    with zipfile.ZipFile(inner_zip_bytes, "w") as inner_archive:
+        inner_archive.writestr("CapsuleData-inner/data.txt", "payload")
+
+    with zipfile.ZipFile(outer_zip, "w") as outer_archive:
+        outer_archive.writestr(
+            "capsule_folders/CapsuleFolder-cap-1.zip",
+            inner_zip_bytes.read_bytes(),
+        )
+
+    prepared_root = prepare_benchmark_directory(outer_zip)
+
+    assert prepared_root == tmp_path / "extracted_capsules"
+    assert (prepared_root / "cap-1" / "CapsuleData-inner" / "data.txt").is_file()
+
+
 def test_score_benchmark_response_for_supported_modes() -> None:
     assert score_benchmark_response("str_verifier", "  Hello  ", "hello")
     assert score_benchmark_response("range_verifier", "(1.5,1.7)", "value 1.6")
@@ -210,7 +301,7 @@ def test_run_benchmark_continues_after_row_failure(
 
     monkeypatch.setattr(cli, "run_orchestrator", fake_run_orchestrator)
 
-    summary = asyncio.run(run_benchmark(csv_path, extracted_root))
+    summary = asyncio.run(run_benchmark(csv_path, benchmark_directory=extracted_root))
 
     assert isinstance(summary, BenchmarkSummary)
     assert summary.total_rows == 2
@@ -238,15 +329,23 @@ def test_main_benchmark_prints_summary(
         rows=[],
     )
 
-    async def fake_run_benchmark() -> BenchmarkSummary:
+    async def fake_run_benchmark(
+        csv_path: Path,
+        benchmark_directory: Path,
+    ) -> BenchmarkSummary:
+        assert csv_path == Path("/tmp/benchmark.csv").resolve()
+        assert benchmark_directory == Path("/tmp/data").resolve()
         return summary
 
     monkeypatch.setattr(cli, "run_benchmark", fake_run_benchmark)
 
-    exit_code = cli.main(["benchmark"])
+    exit_code = cli.main(
+        ["benchmark", "--directory", "/tmp/data", "--csv", "/tmp/benchmark.csv"]
+    )
 
     output = capsys.readouterr().out
     assert exit_code == 0
+    assert "Preparing benchmark data from: /private/tmp/data" in output
     assert "Benchmark Summary" in output
     assert "Total rows: 2" in output
     assert "Accuracy: 50.00%" in output
