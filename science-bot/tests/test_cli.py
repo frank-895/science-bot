@@ -73,7 +73,12 @@ def test_main_run_prints_human_readable_output(
             capsule_path=capsule_path,
             status="completed",
             answer="stub-answer",
-            metadata={"orchestrator_mode": "stub"},
+            metadata={
+                "classification_family": "aggregate",
+                "resolution_iterations_used": 3,
+                "resolution_selected_files": ["clinical.csv", "metadata.csv"],
+                "execution_notes": ["Execution completed."],
+            },
             error=None,
         )
 
@@ -87,6 +92,10 @@ def test_main_run_prints_human_readable_output(
     assert f"Capsule: {capsule_path}" in output
     assert "Status: completed" in output
     assert "Answer: stub-answer" in output
+    assert "Family: aggregate" in output
+    assert "Resolution iterations: 3" in output
+    assert "Selected files: clinical.csv, metadata.csv" in output
+    assert "Execution notes: Execution completed." in output
 
 
 def test_main_run_returns_error_for_missing_capsule(
@@ -295,7 +304,11 @@ def test_run_benchmark_continues_after_row_failure(
             capsule_path=success_path,
             status="completed",
             answer="ORCHESTRATOR_STUB_RESPONSE",
-            metadata={"orchestrator_mode": "stub"},
+            metadata={
+                "classification_family": "aggregate",
+                "resolution_iterations_used": 2,
+                "resolution_selected_files": ["clinical.csv"],
+            },
             error=None,
         )
 
@@ -326,7 +339,21 @@ def test_main_benchmark_prints_summary(
         incorrect_rows=1,
         accuracy=0.5,
         elapsed_seconds=0.123,
-        rows=[],
+        rows=[
+            cli.BenchmarkRowResult(
+                question_id="q1",
+                question="What is one?",
+                capsule_path=Path("/tmp/cap-1"),
+                eval_mode="str_verifier",
+                ideal="1",
+                response="1",
+                classification_family="aggregate",
+                selected_files=["clinical.csv"],
+                resolution_iterations_used=2,
+                is_correct=True,
+                status="completed",
+            )
+        ],
     )
 
     async def fake_run_benchmark(
@@ -350,3 +377,6 @@ def test_main_benchmark_prints_summary(
     assert "Benchmark Summary" in output
     assert "Total rows: 2" in output
     assert "Accuracy: 50.00%" in output
+    assert "family=aggregate" in output
+    assert "iters=2" in output
+    assert "files=clinical.csv" in output

@@ -8,7 +8,7 @@ import time
 import zipfile
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -72,6 +72,9 @@ class BenchmarkRowResult(BaseModel):
     eval_mode: Literal["str_verifier", "range_verifier", "llm_verifier"]
     ideal: str
     response: str | None
+    classification_family: str | None = None
+    selected_files: list[str] = Field(default_factory=list)
+    resolution_iterations_used: int | None = None
     is_correct: bool
     status: Literal["completed", "failed"]
     error: str | None = None
@@ -431,6 +434,18 @@ async def run_benchmark(
                     eval_mode=row.eval_mode,
                     ideal=row.ideal,
                     response=orchestrator_result.answer,
+                    classification_family=_extract_metadata_string(
+                        orchestrator_result.metadata,
+                        "classification_family",
+                    ),
+                    selected_files=_extract_metadata_str_list(
+                        orchestrator_result.metadata,
+                        "resolution_selected_files",
+                    ),
+                    resolution_iterations_used=_extract_metadata_int(
+                        orchestrator_result.metadata,
+                        "resolution_iterations_used",
+                    ),
                     is_correct=is_correct,
                     status="completed",
                 )
@@ -481,6 +496,26 @@ def format_run_output(result: OrchestratorResult) -> str:
         f"Status: {result.status}",
         f"Answer: {result.answer}",
     ]
+    classification_family = _extract_metadata_string(
+        result.metadata, "classification_family"
+    )
+    if classification_family is not None:
+        lines.append(f"Family: {classification_family}")
+    resolution_iterations_used = _extract_metadata_int(
+        result.metadata,
+        "resolution_iterations_used",
+    )
+    if resolution_iterations_used is not None:
+        lines.append(f"Resolution iterations: {resolution_iterations_used}")
+    selected_files = _extract_metadata_str_list(
+        result.metadata,
+        "resolution_selected_files",
+    )
+    if selected_files:
+        lines.append(f"Selected files: {', '.join(selected_files)}")
+    execution_notes = _extract_metadata_str_list(result.metadata, "execution_notes")
+    if execution_notes:
+        lines.append(f"Execution notes: {' | '.join(execution_notes)}")
     if result.error:
         lines.append(f"Error: {result.error}")
     return "\n".join(lines)
@@ -510,8 +545,74 @@ def format_benchmark_output(summary: BenchmarkSummary) -> str:
         outcome = "correct" if row.is_correct else "incorrect"
         detail = row.error if row.error else (row.response or "")
         detail_preview = detail.replace("\n", " ")[:80]
-        lines.append(f"- {row.question_id}: {row.status}, {outcome}, {detail_preview}")
+        metadata_bits: list[str] = []
+        if row.classification_family:
+            metadata_bits.append(f"family={row.classification_family}")
+        if row.resolution_iterations_used is not None:
+            metadata_bits.append(f"iters={row.resolution_iterations_used}")
+        if row.selected_files:
+            metadata_bits.append(f"files={','.join(row.selected_files[:2])}")
+        metadata_suffix = f" [{'; '.join(metadata_bits)}]" if metadata_bits else ""
+        lines.append(
+            f"- {row.question_id}: {row.status}, {outcome}{metadata_suffix}, "
+            f"{detail_preview}"
+        )
     return "\n".join(lines)
+
+
+def _extract_metadata_string(
+    metadata: dict[str, object],
+    key: str,
+) -> str | None:
+    """Extract a string value from orchestrator metadata.
+
+    Args:
+        metadata: Orchestrator metadata mapping.
+        key: Metadata key to extract.
+
+    Returns:
+        str | None: String value when present and valid.
+    """
+    value = metadata.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _extract_metadata_int(
+    metadata: dict[str, object],
+    key: str,
+) -> int | None:
+    """Extract an integer value from orchestrator metadata.
+
+    Args:
+        metadata: Orchestrator metadata mapping.
+        key: Metadata key to extract.
+
+    Returns:
+        int | None: Integer value when present and valid.
+    """
+    value = metadata.get(key)
+    return value if isinstance(value, int) else None
+
+
+def _extract_metadata_str_list(
+    metadata: dict[str, object],
+    key: str,
+) -> list[str]:
+    """Extract a list of strings from orchestrator metadata.
+
+    Args:
+        metadata: Orchestrator metadata mapping.
+        key: Metadata key to extract.
+
+    Returns:
+        list[str]: Validated string list or an empty list.
+    """
+    value = metadata.get(key)
+    if not isinstance(value, list):
+        return []
+    if not all(isinstance(item, str) for item in value):
+        return []
+    return cast(list[str], value)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

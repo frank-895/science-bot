@@ -5,7 +5,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-STUB_ANSWER = "ORCHESTRATOR_STUB_RESPONSE"
+from science_bot.pipeline.classification import (
+    ClassificationStageInput,
+    run_classification_stage,
+)
+from science_bot.pipeline.contracts import UnsupportedQuestionClassification
+from science_bot.pipeline.execution import ExecutionStageInput, run_execution_stage
+from science_bot.pipeline.resolution import ResolutionStageInput, run_resolution_stage
 
 
 class OrchestratorRequest(BaseModel):
@@ -45,7 +51,7 @@ class OrchestratorResult(BaseModel):
     capsule_path: Path
     status: Literal["completed"]
     answer: str
-    metadata: dict[str, str | int | float | bool | None]
+    metadata: dict[str, object]
     error: str | None = None
 
 
@@ -56,19 +62,49 @@ async def run_orchestrator(request: OrchestratorRequest) -> OrchestratorResult:
         request: Validated orchestrator request.
 
     Returns:
-        OrchestratorResult: Stub result until the pipeline is implemented.
+        OrchestratorResult: Terminal-facing pipeline result.
 
     Raises:
         FileNotFoundError: If the requested capsule path does not exist.
+        ValueError: If the question is unsupported.
     """
     if not request.capsule_path.exists():
         raise FileNotFoundError(f"Capsule path not found: {request.capsule_path}")
+
+    classification_output = await run_classification_stage(
+        ClassificationStageInput(question=request.question)
+    )
+    classification = classification_output.classification
+    if isinstance(classification, UnsupportedQuestionClassification):
+        raise ValueError(f"Unsupported question: {classification.reason}")
+
+    resolution_output = await run_resolution_stage(
+        ResolutionStageInput(
+            question=request.question,
+            classification=classification,
+            capsule_path=request.capsule_path,
+        )
+    )
+    execution_output = run_execution_stage(
+        ExecutionStageInput(payload=resolution_output.payload)
+    )
 
     return OrchestratorResult(
         question=request.question,
         capsule_path=request.capsule_path,
         status="completed",
-        answer=STUB_ANSWER,
-        metadata={"orchestrator_mode": "stub"},
+        answer=execution_output.answer,
+        metadata={
+            "classification_family": classification.family,
+            "resolution_iterations_used": resolution_output.iterations_used,
+            "resolution_selected_files": resolution_output.selected_files,
+            "resolution_notes": resolution_output.notes,
+            "resolution_steps": [
+                step.model_dump(mode="python") for step in resolution_output.steps
+            ],
+            "execution_family": execution_output.family,
+            "execution_raw_result": execution_output.raw_result,
+            "execution_notes": execution_output.notes,
+        },
         error=None,
     )
