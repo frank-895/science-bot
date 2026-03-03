@@ -3,7 +3,7 @@
 import os
 from typing import TypeVar
 
-from openai import OpenAI, OpenAIError
+from openai import AsyncOpenAI, OpenAIError
 from pydantic import BaseModel
 
 DEFAULT_OPENAI_MODEL = "gpt-5-mini"
@@ -24,7 +24,7 @@ class LLMResponseFormatError(LLMProviderError):
     """Raised when a structured LLM response is missing or invalid."""
 
 
-def parse_structured(
+async def parse_structured(
     *,
     system_prompt: str,
     user_prompt: str,
@@ -62,14 +62,14 @@ def parse_structured(
     if max_retries < 0:
         raise LLMConfigurationError("max_retries must be zero or greater.")
 
-    client = OpenAI(
+    client = AsyncOpenAI(
         api_key=api_key,
         timeout=timeout_seconds,
         max_retries=max_retries,
     )
 
     try:
-        response = client.responses.parse(
+        response = await client.responses.parse(
             model=resolved_model,
             instructions=system_prompt,
             input=user_prompt,
