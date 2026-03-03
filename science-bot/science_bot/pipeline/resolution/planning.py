@@ -1,12 +1,15 @@
 """Internal planning models and deterministic helpers for resolution."""
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeAlias, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from science_bot.pipeline.contracts import QuestionFamily
 from science_bot.pipeline.resolution.schemas import ResolutionStepSummary
+from science_bot.pipeline.resolution.tools.excel import list_excel_sheets
+from science_bot.pipeline.resolution.tools.reader import parse_filename, read_header
 from science_bot.pipeline.resolution.tools.schemas import (
     CapsuleManifest,
     ColumnSearchResult,
@@ -79,6 +82,11 @@ class CandidateFileSummary(BaseModel):
     row_count: int | None = None
     column_count: int | None = None
     is_wide: bool | None = None
+    sheet_names: list[str] = Field(default_factory=list)
+    first_sheet_name: str | None = None
+    first_sheet_columns: list[str] = Field(default_factory=list)
+    sheet_names_truncated: bool = False
+    first_sheet_columns_truncated: bool = False
     relevance_score: int
 
 
@@ -198,6 +206,8 @@ MAX_STEP_MESSAGE_LENGTH = 200
 MAX_ZIP_ENTRIES = 20
 MAX_VALUES = 20
 MAX_ROWS = 5
+MAX_STARTUP_SHEET_NAMES = 10
+MAX_STARTUP_FIRST_SHEET_COLUMNS = 20
 
 _FAMILY_KEYWORDS: dict[QuestionFamily, tuple[str, ...]] = {
     "aggregate": (
@@ -241,6 +251,8 @@ _FAMILY_KEYWORDS: dict[QuestionFamily, tuple[str, ...]] = {
 def shortlist_candidate_files(
     manifest: CapsuleManifest | FullCapsuleManifest,
     family: QuestionFamily,
+    *,
+    capsule_path: Path | None = None,
 ) -> list[CandidateFileSummary]:
     """Reduce a manifest to a family-aware shortlist."""
     keywords = _FAMILY_KEYWORDS[family]
@@ -284,7 +296,83 @@ def shortlist_candidate_files(
         ),
         reverse=True,
     )
-    return candidates[:MAX_CANDIDATE_FILES]
+    shortlisted = candidates[:MAX_CANDIDATE_FILES]
+    if capsule_path is None:
+        return shortlisted
+    return enrich_candidate_files(capsule_path, shortlisted)
+
+
+def enrich_candidate_files(
+    capsule_path: Path,
+    candidates: list[CandidateFileSummary],
+) -> list[CandidateFileSummary]:
+    """Enrich shortlisted candidates with lightweight startup metadata.
+
+    Args:
+        capsule_path: Absolute path to the capsule directory.
+        candidates: Ranked candidate files.
+
+    Returns:
+        list[CandidateFileSummary]: Enriched candidate summaries.
+    """
+    enriched_candidates: list[CandidateFileSummary] = []
+    for candidate in candidates:
+        if candidate.file_type == "excel":
+            enriched_candidates.append(_enrich_excel_candidate(capsule_path, candidate))
+        else:
+            enriched_candidates.append(candidate)
+    return enriched_candidates
+
+
+def _enrich_excel_candidate(
+    capsule_path: Path,
+    candidate: CandidateFileSummary,
+) -> CandidateFileSummary:
+    """Add workbook structure to a shortlisted Excel candidate.
+
+    Args:
+        capsule_path: Absolute path to the capsule directory.
+        candidate: Candidate file summary.
+
+    Returns:
+        CandidateFileSummary: Updated summary, or the original candidate if
+        enrichment could not be completed safely.
+    """
+    candidate_name = candidate.path or candidate.filename
+    try:
+        sheet_names = list_excel_sheets(capsule_path, candidate_name)
+    except Exception:
+        return candidate
+
+    limited_sheet_names = sheet_names[:MAX_STARTUP_SHEET_NAMES]
+    first_sheet_name = limited_sheet_names[0] if limited_sheet_names else None
+    first_sheet_columns: list[str] = []
+    first_sheet_columns_truncated = False
+
+    if first_sheet_name is not None:
+        try:
+            header_ref = parse_filename(
+                capsule_path,
+                f"{candidate_name}::{first_sheet_name}",
+            )
+            headers = read_header(header_ref)
+            first_sheet_columns = headers[:MAX_STARTUP_FIRST_SHEET_COLUMNS]
+            first_sheet_columns_truncated = (
+                len(headers) > MAX_STARTUP_FIRST_SHEET_COLUMNS
+            )
+        except Exception:
+            first_sheet_columns = []
+            first_sheet_columns_truncated = False
+
+    return candidate.model_copy(
+        update={
+            "sheet_names": limited_sheet_names,
+            "first_sheet_name": first_sheet_name,
+            "first_sheet_columns": first_sheet_columns,
+            "sheet_names_truncated": len(sheet_names) > MAX_STARTUP_SHEET_NAMES,
+            "first_sheet_columns_truncated": first_sheet_columns_truncated,
+        }
+    )
 
 
 def summarize_discovery(

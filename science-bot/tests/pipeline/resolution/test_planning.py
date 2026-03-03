@@ -1,3 +1,6 @@
+from pathlib import Path
+
+import openpyxl
 from science_bot.pipeline.resolution.planning import (
     ResolutionScratchpad,
     SearchAttempt,
@@ -41,6 +44,79 @@ def test_shortlist_candidate_files_prefers_family_keywords():
     candidates = shortlist_candidate_files(manifest, "aggregate")
 
     assert candidates[0].filename == "clinical_table.csv"
+
+
+def test_shortlist_candidate_files_enriches_shortlisted_excel_candidates(
+    tmp_path: Path,
+):
+    workbook = openpyxl.Workbook()
+    workbook.active.title = "Tumor vs Normal"
+    workbook.active.append(["protein", "gene", "log2FC", "adj.Pval"])
+    workbook.active.append(["p1", "G1", 1.2, 0.01])
+    workbook.create_sheet("Other")
+    workbook.save(tmp_path / "Proteomic_data.xlsx")
+    workbook.close()
+
+    manifest = CapsuleManifest(
+        capsule_path=str(tmp_path),
+        total_size_bytes=1,
+        files=[
+            FileInfo(
+                filename="Proteomic_data.xlsx",
+                size_bytes=1,
+                size_human="1 B",
+                row_count=10,
+                column_count=4,
+                is_wide=False,
+                file_type="excel",
+            )
+        ],
+    )
+
+    candidates = shortlist_candidate_files(
+        manifest,
+        "differential_expression",
+        capsule_path=tmp_path,
+    )
+
+    assert candidates[0].sheet_names == ["Tumor vs Normal", "Other"]
+    assert candidates[0].first_sheet_name == "Tumor vs Normal"
+    assert candidates[0].first_sheet_columns == [
+        "protein",
+        "gene",
+        "log2FC",
+        "adj.Pval",
+    ]
+
+
+def test_shortlist_candidate_files_keeps_excel_candidate_when_enrichment_fails(
+    tmp_path: Path,
+):
+    manifest = CapsuleManifest(
+        capsule_path=str(tmp_path),
+        total_size_bytes=1,
+        files=[
+            FileInfo(
+                filename="Missing.xlsx",
+                size_bytes=1,
+                size_human="1 B",
+                row_count=10,
+                column_count=4,
+                is_wide=False,
+                file_type="excel",
+            )
+        ],
+    )
+
+    candidates = shortlist_candidate_files(
+        manifest,
+        "regression",
+        capsule_path=tmp_path,
+    )
+
+    assert candidates[0].filename == "Missing.xlsx"
+    assert candidates[0].sheet_names == []
+    assert candidates[0].first_sheet_columns == []
 
 
 def test_tool_result_message_reports_empty_search_results():

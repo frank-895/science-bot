@@ -12,6 +12,8 @@ def test_build_system_prompt_includes_family_guidance():
     prompt = build_system_prompt("aggregate")
     assert "deterministic execution" in prompt
     assert "summary-statistic" in prompt
+    assert "Finalize as soon as the minimum required fields" in prompt
+    assert "If a search returns no matches" in prompt
 
 
 def test_build_resolution_prompt_includes_state():
@@ -43,3 +45,40 @@ def test_build_resolution_prompt_includes_state():
     assert "data.csv" in prompt
     assert "sample_id" in prompt
     assert "Schema found." in prompt
+
+
+def test_build_resolution_prompt_includes_excel_candidate_metadata():
+    prompt = build_resolution_prompt(
+        question="Which proteins are differential?",
+        scratchpad=ResolutionScratchpad(
+            family="differential_expression",
+            question="Which proteins are differential?",
+            candidate_files=[
+                CandidateFileSummary(
+                    filename="Proteomic_data.xlsx",
+                    file_type="excel",
+                    size_human="10 KB",
+                    sheet_names=["Tumor vs Normal"],
+                    first_sheet_name="Tumor vs Normal",
+                    first_sheet_columns=["protein", "gene", "log2FC", "adj.Pval"],
+                    relevance_score=10,
+                )
+            ],
+        ),
+        iterations_remaining=12,
+    )
+
+    assert "sheets=['Tumor vs Normal']" in prompt
+    assert "first_sheet=Tumor vs Normal" in prompt
+    assert "first_columns=['protein', 'gene', 'log2FC', 'adj.Pval']" in prompt
+
+
+def test_build_system_prompt_includes_regression_finalize_checklist():
+    prompt = build_system_prompt("regression")
+
+    assert "filename" in prompt
+    assert "outcome_column" in prompt
+    assert "predictor_column" in prompt
+    assert "covariate_columns" in prompt
+    assert "return_field" in prompt
+    assert "finalize now" in prompt.lower()

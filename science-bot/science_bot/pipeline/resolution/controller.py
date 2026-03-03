@@ -70,7 +70,11 @@ class ResolutionValidationError(ResolutionError):
 
 def _initial_scratchpad(stage_input: ResolutionStageInput) -> ResolutionScratchpad:
     manifest = list_all_capsule_files(stage_input.capsule_path)
-    candidates = shortlist_candidate_files(manifest, stage_input.classification.family)
+    candidates = shortlist_candidate_files(
+        manifest,
+        stage_input.classification.family,
+        capsule_path=stage_input.capsule_path,
+    )
     return ResolutionScratchpad(
         family=stage_input.classification.family,
         question=stage_input.question,

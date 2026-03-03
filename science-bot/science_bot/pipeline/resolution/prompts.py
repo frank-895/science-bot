@@ -29,8 +29,17 @@ Rules:
   - fail
 - Use tools to inspect files, sheets, columns, and values.
 - Never ask to load a full dataframe. Data loading happens after finalize.
-- Prefer concise progress. Do not repeat the same tool call with the same
-  arguments unless necessary.
+- Finalize as soon as the minimum required fields for the family are visible.
+- Do not gather additional evidence once the required fields are identified.
+- Use one targeted tool call only when a specific required field is still
+  missing.
+- Do not repeat the same tool call with the same arguments.
+- If a search returns no matches, do not repeat a similar search. Change
+  strategy: inspect a different file schema, inspect workbook sheets, inspect
+  zip contents, use filename search, or fail if no safe path remains.
+- Prefer direct file or schema inspection over repeated broad search
+  reformulations.
+- Use startup candidate metadata before spending a tool call.
 - Use only real filenames, real sheet names, and real column names already
   observed through tools.
 - If the question cannot be resolved safely within the available evidence,
@@ -41,24 +50,61 @@ Rules:
 
 FAMILY_PROMPT_SUPPLEMENTS: dict[QuestionFamily, str] = {
     "aggregate": """
-Focus on resolving one primary file plus the exact columns and filters required
-for count, summary-statistic, percentage, proportion, or ratio questions.
+You need:
+- filename
+- operation
+- any required filters
+- value_column when the summary-statistic operation requires it
+- numerator or denominator fields when ratio or proportion logic requires them
+- return_format
+If these are already visible from the candidate metadata, known columns, and
+question wording, finalize now.
 """.strip(),
     "hypothesis_test": """
-Focus on resolving the value column, optional second value column, group column,
-group labels, and any filters needed for the statistical test.
+You need:
+- filename
+- test
+- value_column
+- group_column and group values when the test requires grouping
+- optional second_value_column for paired or two-column questions
+- return_field
+If these are already visible from the candidate metadata, known columns, and
+question wording, finalize now.
 """.strip(),
     "regression": """
-Focus on resolving the outcome column, predictor column, covariates, optional
-prediction inputs, and any filters needed for the regression model.
+You need:
+- filename
+- model_type
+- outcome_column
+- predictor_column
+- covariate_columns
+- return_field
+- prediction_inputs only when the return field requires prediction
+If all required fields are already visible in the known columns and question,
+finalize now.
 """.strip(),
     "differential_expression": """
-Focus on resolving precomputed result tables, comparison labels, gene/log fold
-change/p-value columns, and thresholds. Do not choose raw_counts mode.
+You need:
+- mode="precomputed_results"
+- at least one result table file
+- operation
+- comparison labels when required
+- relevant gene, fold-change, and adjusted-p columns when required
+- thresholds when the question explicitly specifies them
+If those are already visible in workbook headers or known columns, finalize now.
+Do not keep exploring once the result-table mapping and required columns are
+known.
 """.strip(),
     "variant_filtering": """
-Focus on resolving the variant file, sample/gene/effect/VAF columns, and any
-cohort-style filters needed for the question.
+You need:
+- filename
+- operation
+- relevant sample, gene, effect, or VAF columns when the operation requires
+  them
+- any requested filters
+- return_format
+If these are already visible from the candidate metadata, known columns, and
+question wording, finalize now.
 """.strip(),
 }
 
@@ -73,13 +119,23 @@ def build_resolution_prompt(
     candidate_lines = []
     for candidate in scratchpad.candidate_files:
         display_name = candidate.path or candidate.filename
-        candidate_lines.append(
-            "- "
-            f"{display_name} "
-            f"(type={candidate.file_type}, size={candidate.size_human}, "
-            f"rows={candidate.row_count}, cols={candidate.column_count}, "
-            f"wide={candidate.is_wide})"
-        )
+        if candidate.file_type == "excel":
+            candidate_lines.append(
+                "- "
+                f"{display_name} "
+                f"(type={candidate.file_type}, size={candidate.size_human}, "
+                f"sheets={candidate.sheet_names}, "
+                f"first_sheet={candidate.first_sheet_name}, "
+                f"first_columns={candidate.first_sheet_columns})"
+            )
+        else:
+            candidate_lines.append(
+                "- "
+                f"{display_name} "
+                f"(type={candidate.file_type}, size={candidate.size_human}, "
+                f"rows={candidate.row_count}, cols={candidate.column_count}, "
+                f"wide={candidate.is_wide})"
+            )
     if not candidate_lines:
         candidate_lines.append("- none")
 
