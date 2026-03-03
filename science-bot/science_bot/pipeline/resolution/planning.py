@@ -134,6 +134,7 @@ class ResolutionScratchpad(BaseModel):
     selected_files: list[str] = Field(default_factory=list)
     known_sheets: dict[str, list[str]] = Field(default_factory=dict)
     known_columns: dict[str, list[str]] = Field(default_factory=dict)
+    known_zip_entries: dict[str, list[str]] = Field(default_factory=dict)
     column_evidence: list[ColumnEvidence] = Field(default_factory=list)
     value_evidence: list[ValueEvidence] = Field(default_factory=list)
     resolved_fields: dict[str, object] = Field(default_factory=dict)
@@ -397,12 +398,17 @@ def summarize_discovery(
 def summarize_tool_result(
     *,
     tool_name: str,
+    arguments: dict[str, object],
     result: object,
     scratchpad: ResolutionScratchpad,
     step_index: int,
 ) -> ResolutionStepSummary:
     """Build a compact step summary from one tool result."""
-    message, truncated = tool_result_message(tool_name, result)
+    message, truncated = tool_result_message(
+        tool_name,
+        result,
+        arguments=arguments,
+    )
     return ResolutionStepSummary(
         step_index=step_index,
         kind="tool",
@@ -435,7 +441,12 @@ def summarize_finalize(
     )
 
 
-def tool_result_message(tool_name: str, result: object) -> tuple[str, bool]:
+def tool_result_message(
+    tool_name: str,
+    result: object,
+    *,
+    arguments: dict[str, object] | None = None,
+) -> tuple[str, bool]:
     """Create a compact human-readable summary for a tool result."""
     if tool_name == "list_all_capsule_files" and isinstance(
         result, FullCapsuleManifest
@@ -488,25 +499,27 @@ def tool_result_message(tool_name: str, result: object) -> tuple[str, bool]:
             truncated,
         )
 
-    if isinstance(result, list) and (
-        not result or isinstance(result[0], ColumnSearchResult)
-    ):
+    if tool_name == "search_filenames" and isinstance(result, list):
+        filename_results = cast(list[FilenameSearchResult], result)
+        if not filename_results:
+            query = cast(
+                str | None,
+                None if arguments is None else arguments.get("query"),
+            )
+            if query is not None:
+                return (f"No matching filenames were found for {query!r}.", False)
+            return ("No matching filenames were found.", False)
+        shown = [entry.path for entry in filename_results[:MAX_VALUES]]
+        truncated = len(filename_results) > MAX_VALUES
+        return (f"Matching filenames: {shown}", truncated)
+
+    if tool_name == "find_files_with_column" and isinstance(result, list):
         search_results = cast(list[ColumnSearchResult], result)
         if not search_results:
             return ("No files with matching columns were found.", False)
         filenames = [entry.filename for entry in search_results[:MAX_VALUES]]
         truncated = len(search_results) > MAX_VALUES
         return (f"Files with matching columns: {filenames}", truncated)
-
-    if isinstance(result, list) and (
-        not result or isinstance(result[0], FilenameSearchResult)
-    ):
-        filename_results = cast(list[FilenameSearchResult], result)
-        if not filename_results:
-            return ("No matching filenames were found.", False)
-        shown = [entry.path for entry in filename_results[:MAX_VALUES]]
-        truncated = len(filename_results) > MAX_VALUES
-        return (f"Matching filenames: {shown}", truncated)
 
     if isinstance(result, ColumnValues):
         values = result.values[:MAX_VALUES]
@@ -567,7 +580,11 @@ def update_scratchpad_from_tool_result(
 ) -> None:
     """Update scratchpad state from one tool result."""
     scratchpad.last_tool_name = tool_name
-    tool_summary, truncated = tool_result_message(tool_name, result)
+    tool_summary, truncated = tool_result_message(
+        tool_name,
+        result,
+        arguments=arguments,
+    )
     scratchpad.last_tool_summary = _truncate(tool_summary, MAX_TOOL_SUMMARY_LENGTH)
 
     if isinstance(result, FileSchema):
@@ -600,9 +617,7 @@ def update_scratchpad_from_tool_result(
                 )
             )
             scratchpad.column_evidence = scratchpad.column_evidence[-20:]
-    elif isinstance(result, list) and (
-        not result or isinstance(result[0], ColumnSearchResult)
-    ):
+    elif tool_name == "find_files_with_column" and isinstance(result, list):
         search_results = cast(list[ColumnSearchResult], result)
         if not search_results:
             _record_failed_search(
@@ -614,9 +629,7 @@ def update_scratchpad_from_tool_result(
             for entry in search_results[:MAX_VALUES]:
                 if entry.filename not in scratchpad.selected_files:
                     scratchpad.selected_files.append(entry.filename)
-    elif isinstance(result, list) and (
-        not result or isinstance(result[0], FilenameSearchResult)
-    ):
+    elif tool_name == "search_filenames" and isinstance(result, list):
         filename_results = cast(list[FilenameSearchResult], result)
         if not filename_results:
             _record_failed_search(
@@ -663,6 +676,9 @@ def update_scratchpad_from_tool_result(
     elif isinstance(result, ZipManifest):
         if result.zip_filename not in scratchpad.selected_files:
             scratchpad.selected_files.append(result.zip_filename)
+        scratchpad.known_zip_entries[result.zip_filename] = [
+            entry.inner_path for entry in result.entries if entry.is_readable
+        ]
         if not any(entry.is_readable for entry in result.entries):
             _record_failed_search(
                 scratchpad=scratchpad,

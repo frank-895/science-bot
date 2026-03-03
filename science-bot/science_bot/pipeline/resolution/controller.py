@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import TypeVar, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from science_bot.pipeline.contracts import QuestionFamily
 from science_bot.pipeline.resolution.assembly import (
@@ -20,6 +20,7 @@ from science_bot.pipeline.resolution.families import (
 from science_bot.pipeline.resolution.planning import (
     BaseResolutionDecision,
     FamilyResolutionDecisionResponse,
+    FamilyResolutionPlan,
     ResolutionScratchpad,
     build_resolved_plan,
     shortlist_candidate_files,
@@ -35,6 +36,7 @@ from science_bot.pipeline.resolution.prompts import (
 from science_bot.pipeline.resolution.schemas import (
     ResolutionStageInput,
     ResolutionStageOutput,
+    ResolutionStepSummary,
 )
 from science_bot.pipeline.resolution.tools import (
     find_files_with_column,
@@ -150,6 +152,7 @@ async def run_resolution_controller(
             )
             step_summary = summarize_tool_result(
                 tool_name=tool_name,
+                arguments=arguments,
                 result=result,
                 scratchpad=scratchpad,
                 step_index=len(steps) + 1,
@@ -172,7 +175,34 @@ async def run_resolution_controller(
                 require_text=_require_text,
                 require_value=_require_value,
             )
-        except ValueError as exc:
+            plan = cast(
+                FamilyResolutionPlan,
+                _normalize_and_validate_plan(
+                    scratchpad=scratchpad,
+                    plan=plan,
+                ),
+            )
+        except (ResolutionValidationError, ValueError, ValidationError) as exc:
+            if _is_recoverable_finalize_issue(str(exc)):
+                rejection_step = _finalize_rejection_step(
+                    scratchpad=scratchpad,
+                    message=str(exc),
+                    step_index=len(steps) + 1,
+                )
+                steps.append(rejection_step)
+                _record_finalize_rejection(scratchpad=scratchpad, message=str(exc))
+                if stage_input.trace_writer is not None:
+                    stage_input.trace_writer.write_event(
+                        event="resolution_finalize",
+                        stage="resolution",
+                        question=stage_input.question,
+                        family=stage_input.classification.family,
+                        payload={
+                            "rejected": True,
+                            "step": rejection_step.model_dump(mode="python"),
+                        },
+                    )
+                continue
             raise ResolutionValidationError(str(exc)) from exc
         try:
             payload, selected_files, extra_notes = assemble_payload(
@@ -440,3 +470,232 @@ def _require_value(value: T | None, field_name: str) -> T:
     if value is None:
         raise ResolutionValidationError(f"{field_name} is required for finalize.")
     return value
+
+
+def _is_recoverable_finalize_issue(message: str) -> bool:
+    """Return whether a finalize validation failure should bounce back."""
+    recoverable_patterns = (
+        "require value_column",
+        "requires group_column",
+        "requires group_a_value and group_b_value",
+        "is required for finalize",
+        "requires result_table_files",
+        "requires at least two comparison_labels",
+        "requires at least two correction_methods",
+        "references unobserved column",
+        "references unknown zip entr",
+        "references ambiguous zip entr",
+    )
+    return any(pattern in message for pattern in recoverable_patterns)
+
+
+def _record_finalize_rejection(
+    *,
+    scratchpad: ResolutionScratchpad,
+    message: str,
+) -> None:
+    """Persist a rejected finalize attempt into compact scratchpad state."""
+    scratchpad.last_tool_name = "finalize"
+    scratchpad.last_tool_summary = message
+    scratchpad.open_questions = (scratchpad.open_questions + [message])[-8:]
+
+
+def _finalize_rejection_step(
+    *,
+    scratchpad: ResolutionScratchpad,
+    message: str,
+    step_index: int,
+) -> ResolutionStepSummary:
+    """Build a concise step summary for a rejected finalize attempt."""
+    return ResolutionStepSummary(
+        step_index=step_index,
+        kind="finalize",
+        message=f"Finalize rejected: {message}",
+        selected_files=scratchpad.selected_files,
+        resolved_field_keys=sorted(scratchpad.resolved_fields.keys()),
+    )
+
+
+def _normalize_and_validate_plan(
+    *,
+    scratchpad: ResolutionScratchpad,
+    plan: BaseModel,
+) -> BaseModel:
+    """Normalize resolved filenames and validate observed columns before assembly."""
+    normalized_plan = _normalize_plan_filenames(scratchpad=scratchpad, plan=plan)
+    _validate_plan_columns(scratchpad=scratchpad, plan=normalized_plan)
+    return normalized_plan
+
+
+def _normalize_plan_filenames(
+    *,
+    scratchpad: ResolutionScratchpad,
+    plan: BaseModel,
+) -> BaseModel:
+    """Normalize archive-backed filenames against observed zip entries."""
+    update: dict[str, object] = {}
+    if hasattr(plan, "filename"):
+        filename = cast(str, plan.filename)
+        update["filename"] = _normalize_observed_filename(
+            scratchpad=scratchpad,
+            filename=filename,
+        )
+    if hasattr(plan, "result_table_files"):
+        result_table_files = cast(dict[str, str], plan.result_table_files)
+        update["result_table_files"] = {
+            label: _normalize_observed_filename(
+                scratchpad=scratchpad,
+                filename=filename,
+            )
+            for label, filename in result_table_files.items()
+        }
+    if not update:
+        return plan
+    return plan.model_copy(update=update)
+
+
+def _normalize_observed_filename(
+    *,
+    scratchpad: ResolutionScratchpad,
+    filename: str,
+) -> str:
+    """Normalize a finalized filename against observed archive entries."""
+    if ".zip/" in filename:
+        zip_filename, inner_path = filename.split(".zip/", 1)
+        zip_filename = f"{zip_filename}.zip"
+        known_entries = scratchpad.known_zip_entries.get(zip_filename)
+        if known_entries is None:
+            return filename
+        if inner_path not in known_entries:
+            raise ResolutionValidationError(
+                "Finalize references unknown zip entries in "
+                f"{zip_filename}: {inner_path}"
+            )
+        return filename
+
+    if filename.endswith(".zip"):
+        return filename
+
+    matches: list[str] = []
+    for zip_filename, entries in scratchpad.known_zip_entries.items():
+        for entry in entries:
+            if entry == filename or entry.endswith(f"/{filename}"):
+                matches.append(f"{zip_filename}/{entry}")
+    if not matches:
+        return filename
+    if len(matches) > 1:
+        raise ResolutionValidationError(
+            f"Finalize references ambiguous zip entries for {filename!r}: {matches}"
+        )
+    return matches[0]
+
+
+def _validate_plan_columns(
+    *,
+    scratchpad: ResolutionScratchpad,
+    plan: BaseModel,
+) -> None:
+    """Reject finalize when referenced columns were never observed."""
+    filename_to_columns = _observed_columns_by_filename(scratchpad)
+    missing: dict[str, list[str]] = {}
+
+    if hasattr(plan, "filename"):
+        filename = cast(str, plan.filename)
+        required = _required_columns_for_plan(plan)
+        missing_columns = [
+            column
+            for column in required
+            if column not in filename_to_columns.get(filename, set())
+        ]
+        if missing_columns:
+            missing[filename] = missing_columns
+
+    if hasattr(plan, "result_table_files"):
+        result_table_files = cast(dict[str, str], plan.result_table_files)
+        required = _required_columns_for_plan(plan)
+        for filename in result_table_files.values():
+            missing_columns = [
+                column
+                for column in required
+                if column is not None
+                and column not in filename_to_columns.get(filename, set())
+            ]
+            if missing_columns:
+                missing[filename] = missing_columns
+
+    if not missing:
+        return
+
+    detail = ", ".join(
+        f"{filename}: {sorted(set(columns))}" for filename, columns in missing.items()
+    )
+    raise ResolutionValidationError(f"Finalize references unobserved columns. {detail}")
+
+
+def _observed_columns_by_filename(
+    scratchpad: ResolutionScratchpad,
+) -> dict[str, set[str]]:
+    """Return all observed columns keyed by filename."""
+    observed: dict[str, set[str]] = {
+        filename: set(columns) for filename, columns in scratchpad.known_columns.items()
+    }
+    for candidate in scratchpad.candidate_files:
+        if not candidate.first_sheet_columns:
+            continue
+        candidate_name = candidate.path or candidate.filename
+        observed.setdefault(candidate_name, set()).update(candidate.first_sheet_columns)
+        if candidate.path is not None:
+            observed.setdefault(candidate.filename, set()).update(
+                candidate.first_sheet_columns
+            )
+    return observed
+
+
+def _required_columns_for_plan(plan: BaseModel) -> list[str]:
+    """Return all column names referenced by a resolved plan."""
+    direct_fields = (
+        "value_column",
+        "second_value_column",
+        "group_column",
+        "outcome_column",
+        "predictor_column",
+        "sample_column",
+        "gene_column",
+        "effect_column",
+        "vaf_column",
+        "numerator_mask_column",
+        "denominator_mask_column",
+        "log_fold_change_column",
+        "adjusted_p_value_column",
+        "base_mean_column",
+    )
+    columns: list[str] = []
+    for field_name in direct_fields:
+        value = getattr(plan, field_name, None)
+        if isinstance(value, str):
+            columns.append(value)
+    for field_name in ("covariate_columns",):
+        values = getattr(plan, field_name, [])
+        columns.extend(cast(list[str], values))
+    prediction_inputs = getattr(plan, "prediction_inputs", {})
+    if isinstance(prediction_inputs, dict):
+        columns.extend(cast(list[str], list(prediction_inputs.keys())))
+    for field_name in ("filters", "numerator_filters", "denominator_filters"):
+        filters = getattr(plan, field_name, [])
+        for filter_plan in filters:
+            column = getattr(filter_plan, "column", None)
+            if isinstance(column, str):
+                columns.append(column)
+    return _unique_strings(columns)
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    """Return values in order without duplicates."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered

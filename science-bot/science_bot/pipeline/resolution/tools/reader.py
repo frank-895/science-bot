@@ -1,17 +1,20 @@
 """Shared filename parsing and tabular reader helpers for resolution tools."""
 
+import csv
+import gzip
 import zipfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import IO, Literal
+from typing import IO, Literal, cast
 
 import pandas as pd
 from pandas.io.parsers.readers import TextFileReader
 
 TABULAR_EXTENSIONS = {".csv", ".tsv", ".tab", ".xlsx", ".xls"}
 EXCEL_EXTENSIONS = {".xlsx", ".xls"}
+GZIP_MAGIC = b"\x1f\x8b"
 
 
 def excel_engine(extension: str) -> Literal["xlrd", "openpyxl"]:
@@ -195,12 +198,15 @@ def scan_csv_preamble(ref: FileRef) -> tuple[int, str]:
     def iter_lines() -> Iterator[str]:
         if ref.zip_path is not None and ref.inner_path is not None:
             with zipfile.ZipFile(ref.zip_path) as zf:
-                with zf.open(ref.inner_path) as fobj:
+                with zf.open(ref.inner_path) as raw_file:
+                    fobj = _wrap_gzip_stream(raw_file)
                     for raw in fobj:
                         yield raw.decode("utf-8", errors="replace")
         else:
-            with open(ref.file_path, encoding="utf-8", errors="replace") as fobj:
-                yield from fobj
+            with open(ref.file_path, "rb") as raw_file:
+                fobj = _wrap_gzip_stream(raw_file)
+                for raw in fobj:
+                    yield raw.decode("utf-8", errors="replace")
 
     skip = 0
     for line in iter_lines():
@@ -226,23 +232,12 @@ def read_header(ref: FileRef) -> list[str]:
         list[str]: Column names.
     """
     if ref.is_excel:
-        engine = excel_engine(ref.extension)
-        if ref.zip_path is not None and ref.inner_path is not None:
-            with zipfile.ZipFile(ref.zip_path) as zf:
-                data = zf.read(ref.inner_path)
-            source = BytesIO(data)
-        else:
-            source = ref.file_path
-        df = pd.read_excel(
-            source,
-            sheet_name=ref.sheet_name,
-            nrows=0,
-            engine=engine,
-        )
-        return list(df.columns)
+        dataframe = _read_excel(ref, nrows=0)
+        return list(dataframe.columns)
 
     _, header_line = scan_csv_preamble(ref)
-    return header_line.split(ref.separator)
+    separator = _sniff_separator(header_line, ref.separator)
+    return _normalize_headers(header_line.split(separator))
 
 
 def count_rows(ref: FileRef) -> int:
@@ -255,30 +250,22 @@ def count_rows(ref: FileRef) -> int:
         int: Number of data rows.
     """
     if ref.is_excel:
-        engine = excel_engine(ref.extension)
-        if ref.zip_path is not None and ref.inner_path is not None:
-            with zipfile.ZipFile(ref.zip_path) as zf:
-                data = zf.read(ref.inner_path)
-            source = BytesIO(data)
-        else:
-            source = ref.file_path
-        df = pd.read_excel(
-            source,
-            sheet_name=ref.sheet_name,
-            usecols=[0],
-            engine=engine,
-        )
+        df = _read_excel(ref, nrows=None)
+        if df.empty:
+            return 0
         return len(df)
 
     skip, _ = scan_csv_preamble(ref)
     row_count = 0
     if ref.zip_path is not None and ref.inner_path is not None:
         with zipfile.ZipFile(ref.zip_path) as zf:
-            with zf.open(ref.inner_path) as fobj:
+            with zf.open(ref.inner_path) as raw_file:
+                fobj = _wrap_gzip_stream(raw_file)
                 for _ in fobj:
                     row_count += 1
     else:
-        with open(ref.file_path, "rb") as fobj:
+        with open(ref.file_path, "rb") as raw_file:
+            fobj = _wrap_gzip_stream(raw_file)
             for _ in fobj:
                 row_count += 1
     return max(0, row_count - 1 - skip)
@@ -319,55 +306,63 @@ def read_tabular(
         )
 
     skip, header_line = scan_csv_preamble(ref)
-    header_cols = header_line.split(ref.separator)
+    separator = _sniff_separator(header_line, ref.separator)
+    header_cols = _normalize_headers(header_line.split(separator))
     if ref.zip_path is not None and ref.inner_path is not None:
         zf = zipfile.ZipFile(ref.zip_path)
         raw_file = zf.open(ref.inner_path)
+        stream = _wrap_gzip_stream(raw_file)
         if chunksize is not None:
-            reader = pd.read_csv(
-                raw_file,
-                sep=ref.separator,
+            reader = _read_csv_with_fallback(
+                stream,
+                sep=separator,
                 names=header_cols,
                 skiprows=skip + 1,
                 usecols=usecols,
                 nrows=nrows,
-                low_memory=False,
                 chunksize=chunksize,
             )
-            return ManagedChunkReader(reader, raw_file=raw_file, zip_file=zf)
-        reader = pd.read_csv(
-            raw_file,
-            sep=ref.separator,
+            return ManagedChunkReader(
+                cast(TextFileReader, reader),
+                raw_file=stream,
+                zip_file=zf,
+            )
+        reader = _read_csv_with_fallback(
+            stream,
+            sep=separator,
             names=header_cols,
             skiprows=skip + 1,
             usecols=usecols,
             nrows=nrows,
-            low_memory=False,
         )
-        raw_file.close()
+        stream.close()
         zf.close()
         return reader
 
+    binary_stream = open(ref.file_path, "rb")
+    stream = _wrap_gzip_stream(binary_stream)
     if chunksize is not None:
-        return pd.read_csv(
-            ref.file_path,
-            sep=ref.separator,
+        reader = _read_csv_with_fallback(
+            stream,
+            sep=separator,
             names=header_cols,
             skiprows=skip + 1,
             usecols=usecols,
             nrows=nrows,
-            low_memory=False,
             chunksize=chunksize,
         )
-    return pd.read_csv(
-        ref.file_path,
-        sep=ref.separator,
-        names=header_cols,
-        skiprows=skip + 1,
-        usecols=usecols,
-        nrows=nrows,
-        low_memory=False,
-    )
+        return ManagedChunkReader(cast(TextFileReader, reader), raw_file=stream)
+    try:
+        return _read_csv_with_fallback(
+            stream,
+            sep=separator,
+            names=header_cols,
+            skiprows=skip + 1,
+            usecols=usecols,
+            nrows=nrows,
+        )
+    finally:
+        stream.close()
 
 
 def _assert_within_capsule(capsule_resolved: Path, target: Path) -> None:
@@ -386,3 +381,164 @@ def _assert_within_capsule(capsule_resolved: Path, target: Path) -> None:
         raise ValueError(
             f"Path {target} escapes the capsule directory {capsule_resolved}"
         ) from exc
+
+
+def _read_excel(
+    ref: FileRef,
+    *,
+    nrows: int | None,
+) -> pd.DataFrame:
+    """Read an Excel file with bounded validation and duplicate-header handling."""
+    engine = excel_engine(ref.extension)
+    try:
+        if ref.zip_path is not None and ref.inner_path is not None:
+            with zipfile.ZipFile(ref.zip_path) as zf:
+                data = zf.read(ref.inner_path)
+            source: BytesIO | Path = BytesIO(data)
+        else:
+            source = ref.file_path
+        dataframe = pd.read_excel(
+            source,
+            sheet_name=ref.sheet_name,
+            nrows=nrows,
+            engine=engine,
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"File does not appear to be a valid Excel workbook: {ref.file_path}"
+        ) from exc
+    dataframe.columns = _normalize_headers(list(dataframe.columns))
+    return dataframe
+
+
+def _read_csv_with_fallback(
+    source: IO[bytes],
+    *,
+    sep: str,
+    names: list[str],
+    skiprows: int,
+    usecols: list[str] | None,
+    nrows: int | None,
+    chunksize: int | None = None,
+) -> pd.DataFrame | TextFileReader:
+    """Read a CSV-like file with bounded parser fallbacks."""
+    try:
+        return _read_csv(
+            source,
+            sep=sep,
+            names=names,
+            skiprows=skiprows,
+            usecols=usecols,
+            nrows=nrows,
+            chunksize=chunksize,
+            engine=None,
+        )
+    except pd.errors.ParserError:
+        source.seek(0)
+        try:
+            return _read_csv(
+                source,
+                sep=sep,
+                names=names,
+                skiprows=skiprows,
+                usecols=usecols,
+                nrows=nrows,
+                chunksize=chunksize,
+                engine="python",
+            )
+        except pd.errors.ParserError:
+            source.seek(0)
+            sniffed_separator = _sniff_csv_separator(source.read(4096), default=sep)
+            source.seek(0)
+            return _read_csv(
+                source,
+                sep=sniffed_separator,
+                names=names,
+                skiprows=skiprows,
+                usecols=usecols,
+                nrows=nrows,
+                chunksize=chunksize,
+                engine="python",
+            )
+
+
+def _normalize_headers(headers: list[str] | list[object]) -> list[str]:
+    """Return deterministic duplicate-safe header names."""
+    counts: dict[str, int] = {}
+    normalized: list[str] = []
+    for raw in headers:
+        base = str(raw)
+        counts[base] = counts.get(base, 0) + 1
+        if counts[base] == 1:
+            normalized.append(base)
+        else:
+            normalized.append(f"{base}__{counts[base]}")
+    return normalized
+
+
+def _wrap_gzip_stream(stream: IO[bytes]) -> IO[bytes]:
+    """Return a gzip reader when the stream begins with gzip magic bytes."""
+    start = stream.read(2)
+    stream.seek(0)
+    if start == GZIP_MAGIC:
+        return cast(IO[bytes], gzip.GzipFile(fileobj=stream))
+    return stream
+
+
+def _sniff_separator(header_line: str, default: str) -> str:
+    """Pick a likely separator from a header line."""
+    candidates = [default, "\t", ",", ";", "|"]
+    best = default
+    best_count = header_line.count(default)
+    for candidate in candidates:
+        count = header_line.count(candidate)
+        if count > best_count:
+            best = candidate
+            best_count = count
+    return best
+
+
+def _sniff_csv_separator(sample: bytes, *, default: str) -> str:
+    """Detect a likely CSV delimiter from a raw byte sample."""
+    text = sample.decode("utf-8", errors="replace")
+    try:
+        dialect = csv.Sniffer().sniff(text, delimiters=",\t;|")
+    except csv.Error:
+        return default
+    return dialect.delimiter
+
+
+def _read_csv(
+    source: IO[bytes],
+    *,
+    sep: str,
+    names: list[str],
+    skiprows: int,
+    usecols: list[str] | None,
+    nrows: int | None,
+    chunksize: int | None,
+    engine: Literal["python"] | None,
+) -> pd.DataFrame | TextFileReader:
+    """Read CSV-like data with a concrete engine and optional chunking."""
+    if chunksize is not None:
+        return pd.read_csv(
+            source,
+            sep=sep,
+            names=names,
+            skiprows=skiprows,
+            usecols=usecols,
+            nrows=nrows,
+            low_memory=False,
+            chunksize=chunksize,
+            engine=engine,
+        )
+    return pd.read_csv(
+        source,
+        sep=sep,
+        names=names,
+        skiprows=skiprows,
+        usecols=usecols,
+        nrows=nrows,
+        low_memory=False,
+        engine=engine,
+    )

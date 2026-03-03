@@ -3,6 +3,7 @@ from pathlib import Path
 from science_bot.pipeline.resolution.tools.tabular import (
     get_column_values,
     get_file_schema,
+    load_dataframe,
 )
 
 
@@ -26,3 +27,21 @@ def test_get_column_values_returns_distinct_values(tmp_path: Path):
 
     assert values.unique_count == 2
     assert values.values == ["A", "B"]
+
+
+def test_get_file_schema_sniffs_semicolon_delimiter_in_csv(tmp_path: Path):
+    file_path = tmp_path / "data.csv"
+    file_path.write_text("sample_id;value\ns1;1\ns2;2\n", encoding="utf-8")
+
+    schema = get_file_schema(tmp_path, "data.csv")
+
+    assert [column.name for column in schema.columns] == ["sample_id", "value"]
+
+
+def test_load_dataframe_uses_normalized_duplicate_header_names(tmp_path: Path):
+    file_path = tmp_path / "data.csv"
+    file_path.write_text("gene,gene,value\nA,B,1\n", encoding="utf-8")
+
+    dataframe = load_dataframe(tmp_path, "data.csv", columns=["gene__2", "value"])
+
+    assert list(dataframe.columns) == ["gene__2", "value"]

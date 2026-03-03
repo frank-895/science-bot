@@ -1,7 +1,11 @@
+import gzip
 import zipfile
 from pathlib import Path
+from typing import cast
 
+import pandas as pd
 from science_bot.pipeline.resolution.tools.reader import parse_filename
+from science_bot.pipeline.resolution.tools.tabular import get_file_schema
 
 
 def test_parse_filename_supports_sheet_suffix(tmp_path: Path):
@@ -23,3 +27,62 @@ def test_parse_filename_supports_zip_inner_paths(tmp_path: Path):
 
     assert ref.zip_path == archive_path.resolve()
     assert ref.inner_path == "inner/data.tsv"
+
+
+def test_get_file_schema_reads_gzip_compressed_csv(tmp_path: Path):
+    file_path = tmp_path / "data.csv"
+    with gzip.open(file_path, "wt", encoding="utf-8") as handle:
+        handle.write("sample_id,value\ns1,1\ns2,2\n")
+
+    schema = get_file_schema(tmp_path, "data.csv")
+
+    assert [column.name for column in schema.columns] == ["sample_id", "value"]
+    assert schema.row_count == 2
+
+
+def test_get_file_schema_normalizes_duplicate_headers(tmp_path: Path):
+    file_path = tmp_path / "data.csv"
+    file_path.write_text("gene,gene,value\nA,B,1\n", encoding="utf-8")
+
+    schema = get_file_schema(tmp_path, "data.csv")
+
+    assert [column.name for column in schema.columns] == [
+        "gene",
+        "gene__2",
+        "value",
+    ]
+
+
+def test_reader_retries_csv_with_python_engine(monkeypatch):
+    calls = []
+
+    class FakeParserError(pd.errors.ParserError):
+        pass
+
+    def fake_read_csv(source, **kwargs):
+        calls.append(kwargs.get("engine", "c"))
+        if len(calls) == 1:
+            raise FakeParserError("bad parse")
+        return pd.DataFrame({"a": [1], "b": [2]})
+
+    monkeypatch.setattr(
+        "science_bot.pipeline.resolution.tools.reader.pd.read_csv",
+        fake_read_csv,
+    )
+
+    from science_bot.pipeline.resolution.tools import reader
+
+    result = cast(
+        pd.DataFrame,
+        reader._read_csv_with_fallback(
+            source=Path(__file__).open("rb"),
+            sep=",",
+            names=["a", "b"],
+            skiprows=0,
+            usecols=None,
+            nrows=None,
+        ),
+    )
+
+    assert list(result.columns) == ["a", "b"]
+    assert calls == [None, "python"]

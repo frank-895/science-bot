@@ -47,3 +47,36 @@ def test_assemble_payload_rejects_non_precomputed_de_mode():
     )
 
     assert plan.mode == "precomputed_results"
+
+
+def test_assemble_payload_preserves_zip_contained_filename(monkeypatch):
+    captured = {}
+
+    def fake_load_dataframe(capsule_path: Path, filename: str, columns: list[str]):
+        captured["filename"] = filename
+        captured["columns"] = columns
+        return pd.DataFrame({"value": [1]})
+
+    monkeypatch.setattr(assembly, "load_dataframe", fake_load_dataframe)
+
+    payload, selected_files, _ = assembly.assemble_payload(
+        capsule_path=Path("/tmp/capsule"),
+        plan=AggregateResolvedPlan(
+            filename="Animals_Cele.busco.zip/run_eukaryota_odb10/full_table.tsv",
+            operation="mean",
+            value_column="value",
+            filters=[],
+            numerator_filters=[],
+            denominator_filters=[],
+            return_format="number",
+        ),
+    )
+
+    assert (
+        captured["filename"]
+        == "Animals_Cele.busco.zip/run_eukaryota_odb10/full_table.tsv"
+    )
+    assert selected_files == [
+        "Animals_Cele.busco.zip/run_eukaryota_odb10/full_table.tsv"
+    ]
+    assert payload.family == "aggregate"
