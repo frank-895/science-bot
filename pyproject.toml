@@ -37,7 +37,7 @@ testpaths = ["science-bot/tests"]
 python_files = ["test_*.py"]
 
 [tool.ty.src]
-exclude = ["tests/"]
+exclude = ["science-bot/tests/"]
 
 [dependency-groups]
 dev = [

@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 from science_bot.pipeline.classification import stage
 from science_bot.pipeline.classification.schemas import ClassificationStageInput
+from science_bot.pipeline.contracts import UnsupportedQuestionClassification
 from science_bot.providers.llm import LLMProviderError
 
 
@@ -85,6 +86,7 @@ def test_run_classification_stage_returns_unsupported_for_out_of_scope_question(
     )
 
     assert result.classification.family == "unsupported"
+    assert isinstance(result.classification, UnsupportedQuestionClassification)
     assert result.classification.reason.startswith("Question asks")
 
 
@@ -106,6 +108,7 @@ def test_run_classification_stage_returns_unsupported_for_ambiguous_question(
     )
 
     assert result.classification.family == "unsupported"
+    assert isinstance(result.classification, UnsupportedQuestionClassification)
     assert "either aggregate or hypothesis_test" in result.classification.reason
 
 
