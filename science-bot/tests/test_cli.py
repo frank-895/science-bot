@@ -344,8 +344,9 @@ def test_main_benchmark_prints_summary(
     )
 
     output = capsys.readouterr().out
+    resolved_directory = Path("/tmp/data").expanduser().resolve()
     assert exit_code == 0
-    assert "Preparing benchmark data from: /private/tmp/data" in output
+    assert f"Preparing benchmark data from: {resolved_directory}" in output
     assert "Benchmark Summary" in output
     assert "Total rows: 2" in output
     assert "Accuracy: 50.00%" in output
