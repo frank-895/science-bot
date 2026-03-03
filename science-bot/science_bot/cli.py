@@ -11,7 +11,14 @@ from pathlib import Path
 from typing import Literal, cast
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from science_bot.pipeline.orchestrator import (
     OrchestratorRequest,
@@ -20,8 +27,17 @@ from science_bot.pipeline.orchestrator import (
 )
 
 REQUIRED_BENCHMARK_COLUMNS = frozenset(
-    {"question", "data_folder", "capsule_uuid", "question_id", "ideal", "eval_mode"}
+    {
+        "question",
+        "data_folder",
+        "capsule_uuid",
+        "question_id",
+        "ideal",
+        "eval_mode",
+    }
 )
+OPTIONAL_BENCHMARK_COLUMNS = frozenset({"id"})
+BENCHMARK_COLUMNS = REQUIRED_BENCHMARK_COLUMNS | OPTIONAL_BENCHMARK_COLUMNS
 BENCHMARK_CONCURRENCY = 20
 NUMERIC_PATTERN = re.compile(r"[-+]?\d*\.?\d+")
 RANGE_PATTERN = re.compile(
@@ -32,8 +48,9 @@ RANGE_PATTERN = re.compile(
 class BenchmarkRow(BaseModel):
     """Raw benchmark input row."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
+    row_id: str | None = Field(default=None, alias="id")
     question: str
     data_folder: str
     capsule_uuid: str
@@ -41,7 +58,13 @@ class BenchmarkRow(BaseModel):
     ideal: str
     eval_mode: Literal["str_verifier", "range_verifier", "llm_verifier"]
 
-    @field_validator("question", "data_folder", "capsule_uuid", "question_id", "ideal")
+    @field_validator(
+        "question",
+        "data_folder",
+        "capsule_uuid",
+        "question_id",
+        "ideal",
+    )
     @classmethod
     def validate_non_empty(cls, value: str) -> str:
         """Validate that required text fields are non-empty.
@@ -59,6 +82,33 @@ class BenchmarkRow(BaseModel):
         if not stripped:
             raise ValueError("Benchmark fields must be non-empty.")
         return stripped
+
+    @field_validator("row_id")
+    @classmethod
+    def validate_row_id(cls, value: str | None) -> str | None:
+        """Normalize an optional benchmark row identifier.
+
+        Args:
+            value: Candidate row identifier.
+
+        Returns:
+            str | None: Stripped identifier or `None` when absent.
+        """
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @model_validator(mode="after")
+    def populate_row_id(self) -> "BenchmarkRow":
+        """Fill the row identifier from the capsule UUID when omitted.
+
+        Returns:
+            BenchmarkRow: Row with a resolved identifier.
+        """
+        if self.row_id is None:
+            self.row_id = self.capsule_uuid
+        return self
 
 
 class BenchmarkRowResult(BaseModel):
@@ -154,7 +204,12 @@ def load_benchmark_rows(csv_path: Path) -> list[BenchmarkRow]:
         rows: list[BenchmarkRow] = []
         for index, raw_row in enumerate(reader, start=2):
             try:
-                rows.append(BenchmarkRow.model_validate(raw_row))
+                filtered_row = {
+                    key: value
+                    for key, value in raw_row.items()
+                    if key in BENCHMARK_COLUMNS
+                }
+                rows.append(BenchmarkRow.model_validate(filtered_row))
             except ValidationError as exc:
                 raise ValueError(f"Invalid benchmark row {index}: {exc}") from exc
 
@@ -178,16 +233,15 @@ def resolve_benchmark_capsule_path(
         FileNotFoundError: If the capsule directory cannot be resolved.
         ValueError: If the row's folder format is invalid or ambiguous.
     """
-    benchmark_root = extracted_capsules_root / row.capsule_uuid
-    if not benchmark_root.is_dir():
-        raise FileNotFoundError(f"Capsule directory not found: {benchmark_root}")
-
     folder_name = Path(row.data_folder).name
     if not folder_name.startswith("CapsuleFolder-") or not folder_name.endswith(".zip"):
         raise ValueError(f"Unsupported data_folder value: {row.data_folder}")
 
-    inner_uuid = folder_name.removeprefix("CapsuleFolder-").removesuffix(".zip")
-    expected_path = benchmark_root / f"CapsuleData-{inner_uuid}"
+    benchmark_root = extracted_capsules_root / row.row_id
+    if not benchmark_root.is_dir():
+        raise FileNotFoundError(f"Capsule directory not found: {benchmark_root}")
+
+    expected_path = benchmark_root / f"CapsuleData-{row.capsule_uuid}"
     if expected_path.is_dir():
         return expected_path
 

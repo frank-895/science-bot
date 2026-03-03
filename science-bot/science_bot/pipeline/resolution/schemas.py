@@ -436,16 +436,55 @@ class ResolutionScratchpad(BaseModel):
     iterations_used: int = 0
 
 
-class ResolutionDecision(BaseModel):
-    """Structured single-step decision returned by the LLM."""
+ResolutionAction: TypeAlias = Literal[
+    "use_list_zip_contents",
+    "use_list_excel_sheets",
+    "use_find_files_with_column",
+    "use_get_file_schema",
+    "use_search_columns",
+    "use_get_column_values",
+    "use_get_column_stats",
+    "use_search_column_for_value",
+    "use_get_row_sample",
+    "finalize",
+    "fail",
+]
+
+
+class PredictionInputEntry(BaseModel):
+    """One regression prediction input value."""
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["use_tool", "finalize", "fail"]
+    column: str
+    value: ScalarValue
+
+
+class ResultTableFileEntry(BaseModel):
+    """One differential-expression comparison label to file mapping."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    filename: str
+
+
+class BaseResolutionDecision(BaseModel):
+    """Flat structured decision returned by the resolver LLM."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: ResolutionAction
     reason: str
-    tool_name: str | None = None
-    arguments: dict[str, object] = Field(default_factory=dict)
-    plan_payload: dict[str, object] | None = None
+    zip_filename: str | None = None
+    filename: str | None = None
+    query: str | None = None
+    column: str | None = None
+    columns: list[str] = Field(default_factory=list)
+    n: int = 10
+    random_sample: bool = False
+    max_values: int = 50
+    max_matches: int = 50
 
     @field_validator("reason")
     @classmethod
@@ -466,20 +505,111 @@ class ResolutionDecision(BaseModel):
             raise ValueError("reason must be non-empty.")
         return stripped
 
-    @model_validator(mode="after")
-    def validate_shape(self) -> "ResolutionDecision":
-        """Validate the decision shape against the selected kind.
+    @field_validator("zip_filename", "filename", "query", "column")
+    @classmethod
+    def validate_optional_text(cls, value: str | None) -> str | None:
+        """Normalize optional text fields.
+
+        Args:
+            value: Candidate optional text.
 
         Returns:
-            ResolutionDecision: Validated decision.
-
-        Raises:
-            ValueError: If required fields are missing.
+            str | None: Stripped text or null.
         """
-        if self.kind == "use_tool":
-            if not self.tool_name:
-                raise ValueError("use_tool requires tool_name.")
-        elif self.kind == "finalize":
-            if self.plan_payload is None:
-                raise ValueError("finalize requires plan_payload.")
-        return self
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class AggregateResolutionDecision(BaseResolutionDecision):
+    """Flat resolver response for aggregate questions."""
+
+    operation: AggregateOperation | None = None
+    value_column: str | None = None
+    numerator_mask_column: str | None = None
+    denominator_mask_column: str | None = None
+    numerator_filters: list[ResolvedFilterPlan] = Field(default_factory=list)
+    denominator_filters: list[ResolvedFilterPlan] = Field(default_factory=list)
+    filters: list[ResolvedFilterPlan] = Field(default_factory=list)
+    return_format: AggregateReturnFormat | None = None
+    decimal_places: int | None = None
+    round_to: int | None = None
+
+
+class HypothesisTestResolutionDecision(BaseResolutionDecision):
+    """Flat resolver response for hypothesis-test questions."""
+
+    test: HypothesisTestType | None = None
+    value_column: str | None = None
+    second_value_column: str | None = None
+    group_column: str | None = None
+    group_a_value: ScalarValue | None = None
+    group_b_value: ScalarValue | None = None
+    filters: list[ResolvedFilterPlan] = Field(default_factory=list)
+    return_field: HypothesisTestReturnField | None = None
+    decimal_places: int | None = None
+    round_to: int | None = None
+
+
+class RegressionResolutionDecision(BaseResolutionDecision):
+    """Flat resolver response for regression questions."""
+
+    model_type: RegressionModelType | None = None
+    outcome_column: str | None = None
+    predictor_column: str | None = None
+    covariate_columns: list[str] = Field(default_factory=list)
+    degree: int | None = None
+    prediction_inputs: list[PredictionInputEntry] = Field(default_factory=list)
+    filters: list[ResolvedFilterPlan] = Field(default_factory=list)
+    return_field: RegressionReturnField | None = None
+    decimal_places: int | None = None
+    round_to: int | None = None
+
+
+class DifferentialExpressionResolutionDecision(BaseResolutionDecision):
+    """Flat resolver response for differential-expression questions."""
+
+    mode: Literal["precomputed_results"] | None = None
+    result_table_files: list[ResultTableFileEntry] = Field(default_factory=list)
+    operation: DifferentialExpressionOperation | None = None
+    comparison_labels: list[str] = Field(default_factory=list)
+    reference_label: str | None = None
+    target_gene: str | None = None
+    gene_column: str | None = None
+    log_fold_change_column: str | None = None
+    adjusted_p_value_column: str | None = None
+    base_mean_column: str | None = None
+    significance_threshold: float | None = None
+    fold_change_threshold: float | None = None
+    basemean_threshold: float | None = None
+    use_lfc_shrinkage: bool = False
+    correction_methods: list[str] = Field(default_factory=list)
+    decimal_places: int | None = None
+    round_to: int | None = None
+
+
+class VariantFilteringResolutionDecision(BaseResolutionDecision):
+    """Flat resolver response for variant-filtering questions."""
+
+    operation: VariantFilteringOperation | None = None
+    sample_column: str | None = None
+    sample_value: ScalarValue | None = None
+    gene_column: str | None = None
+    effect_column: str | None = None
+    vaf_column: str | None = None
+    vaf_min: float | None = None
+    vaf_max: float | None = None
+    filters: list[ResolvedFilterPlan] = Field(default_factory=list)
+    return_format: VariantFilteringReturnFormat | None = None
+    decimal_places: int | None = None
+    round_to: int | None = None
+
+
+FamilyResolutionDecisionResponse: TypeAlias = (
+    AggregateResolutionDecision
+    | HypothesisTestResolutionDecision
+    | RegressionResolutionDecision
+    | DifferentialExpressionResolutionDecision
+    | VariantFilteringResolutionDecision
+)

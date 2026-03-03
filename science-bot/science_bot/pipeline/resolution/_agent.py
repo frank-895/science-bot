@@ -1,12 +1,12 @@
 """Iterative controller for the resolution stage."""
 
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 import pandas as pd
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 
-from science_bot.pipeline.contracts import QuestionFamily
+from science_bot.pipeline.contracts import QuestionFamily, ScalarValue
 from science_bot.pipeline.execution.schemas import (
     AggregateExecutionInput,
     DifferentialExpressionExecutionInput,
@@ -28,16 +28,24 @@ from science_bot.pipeline.resolution._summaries import (
     update_scratchpad_from_tool_result,
 )
 from science_bot.pipeline.resolution.schemas import (
+    AggregateResolutionDecision,
     AggregateResolvedPlan,
+    BaseResolutionDecision,
+    DifferentialExpressionResolutionDecision,
     DifferentialExpressionResolvedPlan,
+    FamilyResolutionDecisionResponse,
     FamilyResolutionPlan,
+    HypothesisTestResolutionDecision,
     HypothesisTestResolvedPlan,
+    PredictionInputEntry,
+    RegressionResolutionDecision,
     RegressionResolvedPlan,
-    ResolutionDecision,
     ResolutionScratchpad,
     ResolutionStageInput,
     ResolutionStageOutput,
     ResolvedFilterPlan,
+    ResultTableFileEntry,
+    VariantFilteringResolutionDecision,
     VariantFilteringResolvedPlan,
 )
 from science_bot.pipeline.resolution.tools import (
@@ -57,6 +65,7 @@ from science_bot.providers import parse_structured
 
 MAX_RESOLUTION_ITERATIONS = 8
 _PLAN_ADAPTER: TypeAdapter[FamilyResolutionPlan] = TypeAdapter(FamilyResolutionPlan)
+T = TypeVar("T")
 
 
 class ResolutionError(Exception):
@@ -104,21 +113,27 @@ async def run_resolution_agent(
 
     for iteration in range(MAX_RESOLUTION_ITERATIONS):
         scratchpad.iterations_used = iteration
-        decision = await parse_structured(
-            system_prompt=build_system_prompt(stage_input.classification.family),
-            user_prompt=build_resolution_prompt(
-                question=stage_input.question,
-                scratchpad=scratchpad,
-                iterations_remaining=MAX_RESOLUTION_ITERATIONS - iteration,
+        decision = cast(
+            FamilyResolutionDecisionResponse,
+            await parse_structured(
+                system_prompt=build_system_prompt(stage_input.classification.family),
+                user_prompt=build_resolution_prompt(
+                    question=stage_input.question,
+                    scratchpad=scratchpad,
+                    iterations_remaining=MAX_RESOLUTION_ITERATIONS - iteration,
+                ),
+                response_model=_response_model_for_family(
+                    stage_input.classification.family
+                ),
             ),
-            response_model=ResolutionDecision,
         )
 
-        if decision.kind == "fail":
+        if decision.action == "fail":
             raise ResolutionError(decision.reason)
 
-        if decision.kind == "use_tool":
-            signature = _tool_signature(decision.tool_name or "", decision.arguments)
+        if decision.action != "finalize":
+            tool_name, arguments = _decision_to_tool_call(decision)
+            signature = _tool_signature(tool_name, arguments)
             if signature == previous_signature:
                 raise ResolutionIterationLimitError(
                     "Resolution repeated the same tool call without new progress."
@@ -126,23 +141,23 @@ async def run_resolution_agent(
             previous_signature = signature
             result = _execute_tool(
                 capsule_path=stage_input.capsule_path,
-                tool_name=decision.tool_name or "",
-                arguments=decision.arguments,
+                tool_name=tool_name,
+                arguments=arguments,
             )
             _capture_tool_specific_state(
                 scratchpad=scratchpad,
-                tool_name=decision.tool_name or "",
-                arguments=decision.arguments,
+                tool_name=tool_name,
+                arguments=arguments,
                 result=result,
             )
             update_scratchpad_from_tool_result(
                 scratchpad=scratchpad,
-                tool_name=decision.tool_name or "",
+                tool_name=tool_name,
                 result=result,
             )
             steps.append(
                 summarize_tool_result(
-                    tool_name=decision.tool_name or "",
+                    tool_name=tool_name,
                     result=result,
                     scratchpad=scratchpad,
                     step_index=len(steps) + 1,
@@ -150,7 +165,7 @@ async def run_resolution_agent(
             )
             continue
 
-        plan = _validate_plan(decision.plan_payload, stage_input.classification.family)
+        plan = _build_plan_from_decision(decision, stage_input.classification.family)
         payload, selected_files, extra_notes = _assemble_payload(
             capsule_path=stage_input.capsule_path,
             plan=plan,
@@ -175,6 +190,31 @@ async def run_resolution_agent(
     raise ResolutionIterationLimitError(
         f"Resolution exceeded {MAX_RESOLUTION_ITERATIONS} iterations."
     )
+
+
+def _response_model_for_family(family: QuestionFamily) -> type[BaseModel]:
+    """Return the structured response model for one supported family.
+
+    Args:
+        family: Supported question family chosen during classification.
+
+    Returns:
+        type[BaseModel]: Family-specific response model class.
+
+    Raises:
+        ResolutionValidationError: If the family is unsupported.
+    """
+    if family == "aggregate":
+        return AggregateResolutionDecision
+    if family == "hypothesis_test":
+        return HypothesisTestResolutionDecision
+    if family == "regression":
+        return RegressionResolutionDecision
+    if family == "differential_expression":
+        return DifferentialExpressionResolutionDecision
+    if family == "variant_filtering":
+        return VariantFilteringResolutionDecision
+    raise ResolutionValidationError(f"Unsupported resolution family: {family}")
 
 
 def _execute_tool(
@@ -327,13 +367,13 @@ def _expect_str_list(arguments: dict[str, object], key: str) -> list[str]:
 
 
 def _validate_plan(
-    payload: dict[str, object] | None,
+    payload: FamilyResolutionPlan,
     family: QuestionFamily,
 ) -> FamilyResolutionPlan:
     """Validate a final plan payload and enforce the selected family.
 
     Args:
-        payload: Raw plan payload returned by the LLM.
+        payload: Family-specific resolved plan returned by the LLM.
         family: Supported family selected by classification.
 
     Returns:
@@ -342,14 +382,192 @@ def _validate_plan(
     Raises:
         ResolutionValidationError: If the plan is missing or mismatched.
     """
-    if payload is None:
-        raise ResolutionValidationError("finalize did not include a plan payload.")
     plan = _PLAN_ADAPTER.validate_python(payload)
     if plan.family != family:
         raise ResolutionValidationError(
             f"finalize plan family {plan.family!r} does not match {family!r}."
         )
     return plan
+
+
+def _build_plan_from_decision(
+    decision: FamilyResolutionDecisionResponse,
+    family: QuestionFamily,
+) -> FamilyResolutionPlan:
+    """Convert a flat finalize decision into a validated resolved plan.
+
+    Args:
+        decision: Family-specific flat resolver response.
+        family: Supported family selected by classification.
+
+    Returns:
+        FamilyResolutionPlan: Validated resolved plan.
+
+    Raises:
+        ResolutionValidationError: If the finalize payload is incomplete.
+    """
+    if decision.action != "finalize":
+        raise ResolutionValidationError("Only finalize decisions can build a plan.")
+
+    if family == "aggregate":
+        aggregate_decision = cast(AggregateResolutionDecision, decision)
+        return _validate_plan(
+            AggregateResolvedPlan(
+                family="aggregate",
+                filename=_require_text(aggregate_decision.filename, "filename"),
+                operation=_require_value(aggregate_decision.operation, "operation"),
+                value_column=aggregate_decision.value_column,
+                numerator_mask_column=aggregate_decision.numerator_mask_column,
+                denominator_mask_column=aggregate_decision.denominator_mask_column,
+                numerator_filters=aggregate_decision.numerator_filters,
+                denominator_filters=aggregate_decision.denominator_filters,
+                filters=aggregate_decision.filters,
+                return_format=_require_value(
+                    aggregate_decision.return_format, "return_format"
+                ),
+                decimal_places=aggregate_decision.decimal_places,
+                round_to=aggregate_decision.round_to,
+            ),
+            family,
+        )
+
+    if family == "hypothesis_test":
+        hypothesis_decision = cast(HypothesisTestResolutionDecision, decision)
+        return _validate_plan(
+            HypothesisTestResolvedPlan(
+                family="hypothesis_test",
+                filename=_require_text(hypothesis_decision.filename, "filename"),
+                test=_require_value(hypothesis_decision.test, "test"),
+                value_column=hypothesis_decision.value_column,
+                second_value_column=hypothesis_decision.second_value_column,
+                group_column=hypothesis_decision.group_column,
+                group_a_value=hypothesis_decision.group_a_value,
+                group_b_value=hypothesis_decision.group_b_value,
+                filters=hypothesis_decision.filters,
+                return_field=_require_value(
+                    hypothesis_decision.return_field, "return_field"
+                ),
+                decimal_places=hypothesis_decision.decimal_places,
+                round_to=hypothesis_decision.round_to,
+            ),
+            family,
+        )
+
+    if family == "regression":
+        regression_decision = cast(RegressionResolutionDecision, decision)
+        return _validate_plan(
+            RegressionResolvedPlan(
+                family="regression",
+                filename=_require_text(regression_decision.filename, "filename"),
+                model_type=_require_value(regression_decision.model_type, "model_type"),
+                outcome_column=_require_text(
+                    regression_decision.outcome_column, "outcome_column"
+                ),
+                predictor_column=_require_text(
+                    regression_decision.predictor_column, "predictor_column"
+                ),
+                covariate_columns=regression_decision.covariate_columns,
+                degree=regression_decision.degree,
+                prediction_inputs=_prediction_inputs_to_dict(
+                    regression_decision.prediction_inputs
+                ),
+                filters=regression_decision.filters,
+                return_field=_require_value(
+                    regression_decision.return_field, "return_field"
+                ),
+                decimal_places=regression_decision.decimal_places,
+                round_to=regression_decision.round_to,
+            ),
+            family,
+        )
+
+    if family == "differential_expression":
+        de_decision = cast(DifferentialExpressionResolutionDecision, decision)
+        return _validate_plan(
+            DifferentialExpressionResolvedPlan(
+                family="differential_expression",
+                mode=_require_value(de_decision.mode, "mode"),
+                result_table_files=_result_table_files_to_dict(
+                    de_decision.result_table_files
+                ),
+                operation=_require_value(de_decision.operation, "operation"),
+                comparison_labels=de_decision.comparison_labels,
+                reference_label=de_decision.reference_label,
+                target_gene=de_decision.target_gene,
+                gene_column=de_decision.gene_column,
+                log_fold_change_column=de_decision.log_fold_change_column,
+                adjusted_p_value_column=de_decision.adjusted_p_value_column,
+                base_mean_column=de_decision.base_mean_column,
+                significance_threshold=de_decision.significance_threshold,
+                fold_change_threshold=de_decision.fold_change_threshold,
+                basemean_threshold=de_decision.basemean_threshold,
+                use_lfc_shrinkage=de_decision.use_lfc_shrinkage,
+                correction_methods=de_decision.correction_methods,
+                decimal_places=de_decision.decimal_places,
+                round_to=de_decision.round_to,
+            ),
+            family,
+        )
+
+    if family == "variant_filtering":
+        variant_decision = cast(VariantFilteringResolutionDecision, decision)
+        return _validate_plan(
+            VariantFilteringResolvedPlan(
+                family="variant_filtering",
+                filename=_require_text(variant_decision.filename, "filename"),
+                operation=_require_value(variant_decision.operation, "operation"),
+                sample_column=variant_decision.sample_column,
+                sample_value=variant_decision.sample_value,
+                gene_column=variant_decision.gene_column,
+                effect_column=variant_decision.effect_column,
+                vaf_column=variant_decision.vaf_column,
+                vaf_min=variant_decision.vaf_min,
+                vaf_max=variant_decision.vaf_max,
+                filters=variant_decision.filters,
+                return_format=_require_value(
+                    variant_decision.return_format, "return_format"
+                ),
+                decimal_places=variant_decision.decimal_places,
+                round_to=variant_decision.round_to,
+            ),
+            family,
+        )
+
+    raise ResolutionValidationError(f"Unsupported finalize family: {family}")
+
+
+def _require_value(value: T | None, field_name: str) -> T:
+    """Require a non-null field from a flat finalize decision.
+
+    Args:
+        value: Candidate optional value.
+        field_name: Field name for error reporting.
+
+    Returns:
+        object: Required value.
+
+    Raises:
+        ResolutionValidationError: If the value is null.
+    """
+    if value is None:
+        raise ResolutionValidationError(f"{field_name} is required for finalize.")
+    return value
+
+
+def _prediction_inputs_to_dict(
+    entries: list[PredictionInputEntry],
+) -> dict[str, ScalarValue]:
+    """Convert structured prediction input entries into a mapping."""
+
+    return {entry.column: entry.value for entry in entries}
+
+
+def _result_table_files_to_dict(
+    entries: list[ResultTableFileEntry],
+) -> dict[str, str]:
+    """Convert structured result table file entries into a mapping."""
+
+    return {entry.label: entry.filename for entry in entries}
 
 
 def _assemble_payload(
@@ -593,3 +811,103 @@ def _to_execution_filters(filters: list[ResolvedFilterPlan]) -> list[ResolvedFil
         )
         for filter_item in filters
     ]
+
+
+def _decision_to_tool_call(
+    decision: BaseResolutionDecision,
+) -> tuple[str, dict[str, object]]:
+    """Convert a flat use-tool decision into a tool call tuple.
+
+    Args:
+        decision: Flat non-final resolver decision.
+
+    Returns:
+        tuple[str, dict[str, object]]: Tool name and arguments.
+
+    Raises:
+        ResolutionValidationError: If the decision action is unsupported.
+    """
+    if decision.action == "use_list_zip_contents":
+        return (
+            "list_zip_contents",
+            {"zip_filename": _require_text(decision.zip_filename, "zip_filename")},
+        )
+    if decision.action == "use_list_excel_sheets":
+        return (
+            "list_excel_sheets",
+            {"filename": _require_text(decision.filename, "filename")},
+        )
+    if decision.action == "use_find_files_with_column":
+        return (
+            "find_files_with_column",
+            {"query": _require_text(decision.query, "query")},
+        )
+    if decision.action == "use_get_file_schema":
+        return (
+            "get_file_schema",
+            {"filename": _require_text(decision.filename, "filename")},
+        )
+    if decision.action == "use_search_columns":
+        return (
+            "search_columns",
+            {
+                "filename": _require_text(decision.filename, "filename"),
+                "query": _require_text(decision.query, "query"),
+            },
+        )
+    if decision.action == "use_get_column_values":
+        return (
+            "get_column_values",
+            {
+                "filename": _require_text(decision.filename, "filename"),
+                "column": _require_text(decision.column, "column"),
+                "max_values": decision.max_values,
+            },
+        )
+    if decision.action == "use_get_column_stats":
+        return (
+            "get_column_stats",
+            {
+                "filename": _require_text(decision.filename, "filename"),
+                "column": _require_text(decision.column, "column"),
+            },
+        )
+    if decision.action == "use_search_column_for_value":
+        return (
+            "search_column_for_value",
+            {
+                "filename": _require_text(decision.filename, "filename"),
+                "column": _require_text(decision.column, "column"),
+                "query": _require_text(decision.query, "query"),
+                "max_matches": decision.max_matches,
+            },
+        )
+    if decision.action == "use_get_row_sample":
+        return (
+            "get_row_sample",
+            {
+                "filename": _require_text(decision.filename, "filename"),
+                "columns": decision.columns,
+                "n": decision.n,
+                "random_sample": decision.random_sample,
+            },
+        )
+    raise ResolutionValidationError(f"Unsupported decision action: {decision.action}")
+
+
+def _require_text(value: str | None, field_name: str) -> str:
+    """Require a non-empty text field from a flat resolver decision.
+
+    Args:
+        value: Candidate optional text field.
+        field_name: Field name for error reporting.
+
+    Returns:
+        str: Required non-empty text.
+
+    Raises:
+        ResolutionValidationError: If the field is missing.
+    """
+    if value is None:
+        raise ResolutionValidationError(f"{field_name} is required for this action.")
+    return value

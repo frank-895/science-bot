@@ -1,6 +1,7 @@
 """Thin OpenAI wrapper for structured LLM responses."""
 
 import os
+import sys
 from typing import TypeVar
 
 from openai import AsyncOpenAI, OpenAIError
@@ -76,6 +77,19 @@ async def parse_structured(
             text_format=response_model,
         )
     except OpenAIError as exc:
+        print(
+            "LLM DEBUG OpenAIError:",
+            {
+                "type": type(exc).__name__,
+                "model": resolved_model,
+                "response_model": response_model.__name__,
+                "status_code": getattr(exc, "status_code", None),
+                "request_id": getattr(exc, "request_id", None),
+                "body": getattr(exc, "body", None),
+                "repr": repr(exc),
+            },
+            file=sys.stderr,
+        )
         raise LLMProviderError(
             f"OpenAI structured response request failed: {exc}"
         ) from exc

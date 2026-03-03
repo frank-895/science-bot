@@ -12,7 +12,18 @@ plan for one supported family.
 
 Rules:
 - You must choose exactly one next action.
-- Allowed actions are: use_tool, finalize, fail.
+- Allowed actions are:
+  - use_list_zip_contents
+  - use_list_excel_sheets
+  - use_find_files_with_column
+  - use_get_file_schema
+  - use_search_columns
+  - use_get_column_values
+  - use_get_column_stats
+  - use_search_column_for_value
+  - use_get_row_sample
+  - finalize
+  - fail
 - Use tools to inspect files, sheets, columns, and values.
 - Never ask to load a full dataframe. Data loading happens after finalize.
 - Prefer concise progress. Do not repeat the same tool call with the same

@@ -118,6 +118,28 @@ def test_load_benchmark_rows_rejects_missing_columns(tmp_path: Path) -> None:
         load_benchmark_rows(csv_path)
 
 
+def test_load_benchmark_rows_defaults_id_to_capsule_uuid(tmp_path: Path) -> None:
+    csv_path = tmp_path / "benchmark.csv"
+    write_benchmark_csv(
+        csv_path,
+        [
+            {
+                "question": "What?",
+                "data_folder": "CapsuleFolder-inner-uuid.zip",
+                "capsule_uuid": "cap-uuid",
+                "question_id": "q1",
+                "ideal": "answer",
+                "eval_mode": "str_verifier",
+            }
+        ],
+    )
+
+    rows = load_benchmark_rows(csv_path)
+
+    assert len(rows) == 1
+    assert rows[0].row_id == "cap-uuid"
+
+
 def test_resolve_benchmark_capsule_path_prefers_expected_match(tmp_path: Path) -> None:
     root = tmp_path / "extracted"
     expected = root / "cap-uuid" / "CapsuleData-inner-uuid"
