@@ -340,7 +340,13 @@ def extract_inner_capsules(source_directory: Path) -> Path:
     extracted_root = source_directory.parent / "extracted_capsules"
     extracted_root.mkdir(parents=True, exist_ok=True)
 
-    for capsule_zip in sorted(source_directory.glob("CapsuleFolder-*.zip")):
+    capsule_archives = sorted(source_directory.rglob("CapsuleFolder-*.zip"))
+    if not capsule_archives:
+        raise ValueError(
+            f"No CapsuleFolder-*.zip archives were found under {source_directory}."
+        )
+
+    for capsule_zip in capsule_archives:
         capsule_uuid = capsule_zip.stem.removeprefix("CapsuleFolder-")
         target_directory = extracted_root / capsule_uuid
         existing_data_directories = [
@@ -379,15 +385,17 @@ def prepare_benchmark_directory(directory_path: Path) -> Path:
         if directory_path.suffix.lower() != ".zip":
             raise ValueError(f"Unsupported benchmark directory file: {directory_path}")
         extracted_directory = extract_outer_archive(directory_path)
+        if any(extracted_directory.rglob("CapsuleFolder-*.zip")):
+            return extract_inner_capsules(extracted_directory)
         if is_extracted_capsule_tree(extracted_directory):
             return extracted_directory
         return extract_inner_capsules(extracted_directory)
 
+    if any(directory_path.rglob("CapsuleFolder-*.zip")):
+        return extract_inner_capsules(directory_path)
+
     if is_extracted_capsule_tree(directory_path):
         return directory_path
-
-    if any(directory_path.glob("CapsuleFolder-*.zip")):
-        return extract_inner_capsules(directory_path)
 
     raise ValueError(
         "Unsupported benchmark directory. Provide a zip archive, a directory of "

@@ -289,6 +289,20 @@ def test_extract_inner_capsules_creates_extracted_capsule_tree(tmp_path: Path) -
     assert not (extracted_root / "cap-1" / "__MACOSX").exists()
 
 
+def test_extract_inner_capsules_finds_archives_recursively(tmp_path: Path) -> None:
+    source_directory = tmp_path / "capsule_folders"
+    nested_directory = source_directory / "nested"
+    nested_directory.mkdir(parents=True)
+    capsule_zip = nested_directory / "CapsuleFolder-cap-1.zip"
+    with zipfile.ZipFile(capsule_zip, "w") as archive:
+        archive.writestr("CapsuleData-inner/data.txt", "payload")
+
+    extracted_root = extract_inner_capsules(source_directory)
+
+    assert extracted_root == tmp_path / "extracted_capsules"
+    assert (extracted_root / "cap-1" / "CapsuleData-inner" / "data.txt").is_file()
+
+
 def test_extract_inner_capsules_reuses_existing_data(tmp_path: Path) -> None:
     source_directory = tmp_path / "capsule_folders"
     source_directory.mkdir()
@@ -330,6 +344,22 @@ def test_prepare_benchmark_directory_extracts_zip_input(tmp_path: Path) -> None:
         )
 
     prepared_root = prepare_benchmark_directory(outer_zip)
+
+    assert prepared_root == tmp_path / "extracted_capsules"
+    assert (prepared_root / "cap-1" / "CapsuleData-inner" / "data.txt").is_file()
+
+
+def test_prepare_benchmark_directory_extracts_already_unzipped_outer_directory(
+    tmp_path: Path,
+) -> None:
+    outer_directory = tmp_path / "capsule_folders"
+    nested_directory = outer_directory / "capsules"
+    nested_directory.mkdir(parents=True)
+    capsule_zip = nested_directory / "CapsuleFolder-cap-1.zip"
+    with zipfile.ZipFile(capsule_zip, "w") as archive:
+        archive.writestr("CapsuleData-inner/data.txt", "payload")
+
+    prepared_root = prepare_benchmark_directory(outer_directory)
 
     assert prepared_root == tmp_path / "extracted_capsules"
     assert (prepared_root / "cap-1" / "CapsuleData-inner" / "data.txt").is_file()
