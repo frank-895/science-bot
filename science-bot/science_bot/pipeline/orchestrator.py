@@ -5,29 +5,28 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from science_bot.pipeline.classification import (
-    ClassificationStageInput,
-    run_classification_stage,
-)
-from science_bot.pipeline.contracts import UnsupportedQuestionClassification
-from science_bot.pipeline.execution import ExecutionStageInput, run_execution_stage
-from science_bot.pipeline.resolution import ResolutionStageInput, run_resolution_stage
 from science_bot.tracing import TraceWriter
 
 
 class OrchestratorRequest(BaseModel):
-    """Validated request for running the pipeline orchestrator."""
+    """Validated request for running the pipeline orchestrator.
+
+    Attributes:
+        question: User question that should be answered from the capsule.
+        capsule_path: Filesystem path to the extracted capsule directory.
+        trace_writer: Optional trace writer for structured run diagnostics.
+    """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     question: str
     capsule_path: Path
-    trace_writer: "TraceWriter | None" = None
+    trace_writer: TraceWriter | None = None
 
     @field_validator("question")
     @classmethod
     def validate_question(cls, value: str) -> str:
-        """Validate the question text.
+        """Validate question text.
 
         Args:
             value: Candidate question text.
@@ -40,12 +39,21 @@ class OrchestratorRequest(BaseModel):
         """
         stripped = value.strip()
         if not stripped:
-            raise ValueError("question must be non-empty.")
+            raise ValueError("question must be non-empty")
         return stripped
 
 
 class OrchestratorResult(BaseModel):
-    """Terminal-facing result from the orchestrator."""
+    """Terminal-facing result from the orchestrator.
+
+    Attributes:
+        question: Original user question.
+        capsule_path: Filesystem path used for execution.
+        status: Terminal status for run completion.
+        answer: Final answer string returned to CLI callers.
+        metadata: Structured metadata payload for downstream formatting.
+        error: Optional error message when failure details are attached.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -58,164 +66,39 @@ class OrchestratorResult(BaseModel):
 
 
 async def run_orchestrator(request: OrchestratorRequest) -> OrchestratorResult:
-    """Run the pipeline orchestrator.
+    """Run a temporary stub orchestrator.
 
     Args:
         request: Validated orchestrator request.
 
     Returns:
-        OrchestratorResult: Terminal-facing pipeline result.
+        OrchestratorResult: Deterministic placeholder output.
 
     Raises:
-        FileNotFoundError: If the requested capsule path does not exist.
-        ValueError: If the question is unsupported.
+        FileNotFoundError: If the capsule path does not exist.
     """
     if not request.capsule_path.exists():
         raise FileNotFoundError(f"Capsule path not found: {request.capsule_path}")
 
     if request.trace_writer is not None:
         request.trace_writer.write_event(
-            event="classification_started",
-            stage="classification",
+            event="orchestrator_stub_used",
+            stage="orchestrator",
             question=request.question,
             payload={"capsule_path": request.capsule_path},
-        )
-
-    try:
-        classification_output = await run_classification_stage(
-            ClassificationStageInput(
-                question=request.question,
-                trace_writer=request.trace_writer,
-            )
-        )
-    except Exception as exc:
-        if request.trace_writer is not None:
-            request.trace_writer.write_event(
-                event="run_failed",
-                stage="classification",
-                question=request.question,
-                payload={"error": str(exc)},
-            )
-        raise
-    classification = classification_output.classification
-    if request.trace_writer is not None:
-        request.trace_writer.write_event(
-            event="classification_finished",
-            stage="classification",
-            question=request.question,
-            family=classification.family,
-            payload={
-                "classification": classification.model_dump(mode="python"),
-            },
-        )
-    if isinstance(classification, UnsupportedQuestionClassification):
-        if request.trace_writer is not None:
-            request.trace_writer.write_event(
-                event="run_failed",
-                stage="classification",
-                question=request.question,
-                family=classification.family,
-                payload={"error": classification.reason},
-            )
-        raise ValueError(f"Unsupported question: {classification.reason}")
-
-    if request.trace_writer is not None:
-        request.trace_writer.write_event(
-            event="resolution_started",
-            stage="resolution",
-            question=request.question,
-            family=classification.family,
-            payload={"capsule_path": request.capsule_path},
-        )
-    try:
-        resolution_output = await run_resolution_stage(
-            ResolutionStageInput(
-                question=request.question,
-                classification=classification,
-                capsule_path=request.capsule_path,
-                trace_writer=request.trace_writer,
-            )
-        )
-    except Exception as exc:
-        if request.trace_writer is not None:
-            request.trace_writer.write_event(
-                event="run_failed",
-                stage="resolution",
-                question=request.question,
-                family=classification.family,
-                payload={"error": str(exc)},
-            )
-        raise
-    if request.trace_writer is not None:
-        request.trace_writer.write_event(
-            event="resolution_finished",
-            stage="resolution",
-            question=request.question,
-            family=classification.family,
-            payload={
-                "iterations_used": resolution_output.iterations_used,
-                "selected_files": resolution_output.selected_files,
-                "notes": resolution_output.notes,
-                "steps": [
-                    step.model_dump(mode="python") for step in resolution_output.steps
-                ],
-            },
-        )
-
-    if request.trace_writer is not None:
-        request.trace_writer.write_event(
-            event="execution_started",
-            stage="execution",
-            question=request.question,
-            family=classification.family,
-            payload={
-                "payload_family": resolution_output.payload.family,
-            },
-        )
-    try:
-        execution_output = run_execution_stage(
-            ExecutionStageInput(payload=resolution_output.payload)
-        )
-    except Exception as exc:
-        if request.trace_writer is not None:
-            request.trace_writer.write_event(
-                event="run_failed",
-                stage="execution",
-                question=request.question,
-                family=classification.family,
-                payload={"error": str(exc)},
-            )
-        raise
-    if request.trace_writer is not None:
-        request.trace_writer.write_event(
-            event="execution_finished",
-            stage="execution",
-            question=request.question,
-            family=classification.family,
-            payload={
-                "family": execution_output.family,
-                "answer": execution_output.answer,
-                "raw_result": execution_output.raw_result,
-                "notes": execution_output.notes,
-            },
         )
 
     return OrchestratorResult(
         question=request.question,
         capsule_path=request.capsule_path,
         status="completed",
-        answer=execution_output.answer,
+        answer="ORCHESTRATOR_STUB_RESPONSE",
         metadata={
-            "classification_family": classification.family,
-            "resolution_iterations_used": resolution_output.iterations_used,
-            "resolution_selected_files": resolution_output.selected_files,
-            "resolution_notes": resolution_output.notes,
-            "resolution_steps": [
-                step.model_dump(mode="python") for step in resolution_output.steps
-            ],
-            "execution_family": execution_output.family,
-            "execution_raw_result": execution_output.raw_result,
-            "execution_notes": execution_output.notes,
+            "classification_family": "stub",
+            "resolution_iterations_used": 0,
+            "resolution_selected_files": [],
+            "execution_family": "stub",
+            "execution_notes": ["Stub orchestrator: analysis not yet implemented."],
         },
         error=None,
     )
