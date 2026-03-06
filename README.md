@@ -3,25 +3,31 @@ An AI-powered agent that analyses life science datasets and answers scientific q
 
 ## How to use science-bot
 
-1. Save the `capsule_folders.zip` and `BixBenchFiltered_50_clean.csv` locally. 
-2. Clone the repository:
+1. Clone the repository:
 
 ```bash
 git clone https://github.com/frank-895/science-bot.git
 ```
 
-3. Copy `.env.example` and rename to `.env`. Provide an OpenAI API key.
-4. To run the benchmark:
+2. Configure `.env` from `.env.example` with `OPENAI_API_KEY`.
+3. Start executor workers:
 
 ```bash
-uv run science-bot benchmark --directory <path/to/capsule_folders.zip> --csv <path/to/BixBenchFiltered_50_clean.csv>
+docker compose up -d --build --scale runner=4
 ```
 
-5. To ask your own question:
+## Run benchmark
 
 ```bash
-uv run science-bot run --question "question string" --capsule <path/to/capsule>
+uv --project science-bot run science-bot benchmark \
+  --directory <path/to/capsule_folders.zip> \
+  --csv <path/to/BixBenchFiltered_50_clean.csv>
+  --trace-dir <path/to/logs>                          # optional tracing
+
 ```
 
-6. Optionally include the argument `--trace-dir <path/to/logs>` to save detailed logs locally.
+Stop workers:
 
+```bash
+docker compose down
+```

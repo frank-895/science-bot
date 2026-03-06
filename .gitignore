@@ -209,3 +209,5 @@ __marimo__/
 data/*
 .claude/
 debug/
+# science-bot executor artifacts
+.science-bot/

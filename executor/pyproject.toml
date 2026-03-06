@@ -1,0 +1,23 @@
+[project]
+name = "executor"
+version = "0.1.0"
+description = "Container-backed Python execution runtime for science-bot."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.3",
+    "pydeseq2>=0.5.2",
+    "scikit-learn>=1.7.2",
+    "scipy>=1.15.3",
+    "statsmodels>=0.14.6",
+    "xlrd>=2.0.2",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["executor*"]

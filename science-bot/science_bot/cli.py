@@ -20,10 +20,10 @@ from pydantic import (
     model_validator,
 )
 
-from science_bot.pipeline.orchestrator import (
-    OrchestratorRequest,
-    OrchestratorResult,
-    run_orchestrator,
+from science_bot.pipeline.orchestrator import OrchestratorRequest, run_orchestrator
+from science_bot.providers.executor import (
+    PythonExecutorUnavailableError,
+    ensure_python_executor_ready,
 )
 from science_bot.tracing import (
     BenchmarkRowTraceSummary,
@@ -761,6 +761,15 @@ def _extract_metadata_str_list(
     return cast(list[str], value)
 
 
+def ensure_executor_preflight() -> None:
+    """Validate Docker executor readiness when execution is enabled.
+
+    Raises:
+        PythonExecutorUnavailableError: If the executor pool is not ready.
+    """
+    ensure_python_executor_ready()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the top-level science-bot CLI.
 
@@ -777,6 +786,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.command == "benchmark":
+            ensure_executor_preflight()
             benchmark_directory = Path(args.directory).expanduser().resolve()
             csv_path = Path(args.csv).expanduser().resolve()
             trace_writer = (
@@ -802,7 +812,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             print(format_benchmark_output(summary))
             return 0
-    except (ValidationError, ValueError, FileNotFoundError) as exc:
+    except (
+        PythonExecutorUnavailableError,
+        ValidationError,
+        ValueError,
+        FileNotFoundError,
+    ) as exc:
         trace_writer = locals().get("trace_writer")
         if isinstance(trace_writer, TraceWriter):
             trace_writer.write_event(

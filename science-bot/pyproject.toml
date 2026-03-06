@@ -1,0 +1,24 @@
+[project]
+name = "science-bot"
+version = "0.1.0"
+description = "AI-powered life science dataset analysis agent."
+requires-python = ">=3.10"
+dependencies = [
+    "executor",
+    "openai>=2.24.0",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.1.1",
+]
+
+[project.scripts]
+science-bot = "science_bot.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["science_bot*"]
+
+[tool.uv.sources]
+executor = { path = "../executor", editable = true }
