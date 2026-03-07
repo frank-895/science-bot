@@ -32,17 +32,17 @@ async def run_agent(
     *,
     question: str,
     capsule_path: Path,
-    execution_capsule_path: Path | None = None,
+    capsule_manifest: str | None = None,
     execution_id: str | None = None,
     trace_writer: TraceWriter | None = None,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
 ) -> AgentRunResult:
-    """Run the real-mode agent loop without oracle correctness feedback.
+    """Run the real-mode agent loop.
 
     Args:
         question: Natural language question to answer.
-        capsule_path: Capsule data directory.
-        execution_capsule_path: Container-visible capsule path for scripts.
+        capsule_path: Capsule path used by generated scripts.
+        capsule_manifest: Optional precomputed recursive file listing.
         execution_id: Optional question-scoped execution identifier.
         trace_writer: Optional trace writer for iteration-level diagnostics.
         max_iterations: Maximum number of decision iterations.
@@ -56,15 +56,12 @@ async def run_agent(
     request = AgentRunRequest(
         question=question,
         capsule_path=capsule_path,
-        execution_capsule_path=execution_capsule_path,
+        capsule_manifest=capsule_manifest,
         max_iterations=max_iterations,
     )
     available_packages = _safe_list_packages()
-    prompt_capsule_path = request.execution_capsule_path or request.capsule_path
-    capsule_manifest = _build_capsule_manifest(
-        host_capsule_path=request.capsule_path,
-        prompt_capsule_path=prompt_capsule_path,
-    )
+    prompt_capsule_path = request.capsule_path
+    resolved_manifest = request.capsule_manifest or "(manifest unavailable)"
     steps: list[AgentStepRecord] = []
     latest_candidate_answer: str | None = None
     system_prompt = build_system_prompt(request.max_iterations)
@@ -83,7 +80,7 @@ async def run_agent(
         user_prompt = build_user_prompt(
             question=request.question,
             capsule_path=prompt_capsule_path,
-            capsule_manifest=capsule_manifest,
+            capsule_manifest=resolved_manifest,
             available_packages=available_packages,
             step_summary=summarize_steps(steps),
             iteration=iteration,
@@ -298,40 +295,6 @@ def _safe_list_packages() -> list[str]:
     """
     packages = list_available_python_packages()
     return sorted(packages)
-
-
-def _build_capsule_manifest(
-    *,
-    host_capsule_path: Path,
-    prompt_capsule_path: Path,
-    max_entries: int = 200,
-) -> str:
-    """Build a bounded recursive file manifest for prompt grounding.
-
-    Args:
-        host_capsule_path: Host-visible capsule path used for filesystem reads.
-        prompt_capsule_path: Prompt-visible capsule path used in generated scripts.
-        max_entries: Maximum file paths included.
-
-    Returns:
-        str: Newline-separated manifest string.
-    """
-    if not host_capsule_path.exists():
-        return "(capsule path not found)"
-
-    files = sorted(path for path in host_capsule_path.rglob("*") if path.is_file())
-    if not files:
-        return "(no files found)"
-
-    lines: list[str] = []
-    for file_path in files[:max_entries]:
-        relative_path = file_path.relative_to(host_capsule_path)
-        lines.append(str(prompt_capsule_path / relative_path))
-
-    if len(files) > max_entries:
-        lines.append(f"... ({len(files) - max_entries} more files)")
-
-    return "\n".join(lines)
 
 
 def _build_execution_run_id(execution_id: str | None, iteration: int) -> str:

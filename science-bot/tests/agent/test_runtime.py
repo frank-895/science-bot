@@ -60,7 +60,7 @@ def test_run_agent_records_python_then_respond_steps(
         run_agent(
             question="How many rows?",
             capsule_path=tmp_path,
-            execution_capsule_path=Path("/capsules/row1"),
+            capsule_manifest="/capsules/row1/file.csv",
             execution_id="bix-1",
             max_iterations=3,
         )
@@ -103,7 +103,7 @@ def test_run_agent_need_info_is_terminal(
         run_agent(
             question="What is the result?",
             capsule_path=tmp_path,
-            execution_capsule_path=Path("/capsules/row1"),
+            capsule_manifest="/capsules/row1/file.csv",
             max_iterations=6,
         )
     )
@@ -164,7 +164,7 @@ def test_run_agent_returns_latest_candidate_after_budget(
         run_agent(
             question="Question?",
             capsule_path=tmp_path,
-            execution_capsule_path=Path("/capsules/row1"),
+            capsule_manifest="/capsules/row1/file.csv",
             max_iterations=3,
         )
     )
@@ -217,7 +217,7 @@ def test_run_agent_fails_when_no_answer_after_budget(
         run_agent(
             question="Question?",
             capsule_path=tmp_path,
-            execution_capsule_path=Path("/capsules/row1"),
+            capsule_manifest="/capsules/row1/file.csv",
             max_iterations=2,
         )
     )
@@ -281,7 +281,7 @@ def test_run_agent_repairs_invalid_decision_once(
         run_agent(
             question="Question?",
             capsule_path=tmp_path,
-            execution_capsule_path=Path("/capsules/row1"),
+            capsule_manifest="/capsules/row1/file.csv",
             max_iterations=1,
         )
     )
@@ -312,7 +312,7 @@ def test_run_agent_fails_after_repair_retry_exhausted(
         run_agent(
             question="Question?",
             capsule_path=tmp_path,
-            execution_capsule_path=Path("/capsules/row1"),
+            capsule_manifest="/capsules/row1/file.csv",
             max_iterations=3,
         )
     )
@@ -394,7 +394,7 @@ def test_run_agent_writes_iteration_trace_events(
         run_agent(
             question="Question?",
             capsule_path=tmp_path,
-            execution_capsule_path=Path("/capsules/row1"),
+            capsule_manifest="/capsules/row1/file.csv",
             execution_id="bix-trace",
             trace_writer=trace_writer,
             max_iterations=2,

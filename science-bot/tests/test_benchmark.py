@@ -8,6 +8,7 @@ from science_bot.agent.orchestrator import OrchestratorRequest, OrchestratorResu
 from science_bot.benchmark import (
     BenchmarkRow,
     BenchmarkSummary,
+    build_capsule_manifest,
     extract_inner_capsules,
     extract_outer_archive,
     initialize_fixed_trace_writer,
@@ -283,6 +284,20 @@ def test_to_executor_capsule_path_maps_under_mount_root(tmp_path: Path) -> None:
     assert mapped == (
         benchmark.EXECUTOR_CAPSULES_MOUNT_ROOT / "cap-1" / "CapsuleData-inner"
     )
+
+
+def test_build_capsule_manifest_maps_to_prompt_paths(tmp_path: Path) -> None:
+    host_capsule = tmp_path / "host" / "CapsuleData-x"
+    file_path = host_capsule / "nested" / "table.csv"
+    file_path.parent.mkdir(parents=True)
+    file_path.write_text("a,b\n1,2\n", encoding="utf-8")
+
+    manifest = build_capsule_manifest(
+        host_capsule_path=host_capsule,
+        prompt_capsule_path=Path("/capsules/abc/CapsuleData-x"),
+    )
+
+    assert "/capsules/abc/CapsuleData-x/nested/table.csv" in manifest
 
 
 def test_score_benchmark_response_for_supported_modes() -> None:

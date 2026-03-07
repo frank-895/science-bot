@@ -121,8 +121,8 @@ class AgentRunRequest(BaseModel):
 
     Attributes:
         question: User question to answer.
-        capsule_path: Filesystem path to the capsule data directory.
-        execution_capsule_path: Optional container-visible path used in prompts.
+        capsule_path: Filesystem path used by generated Python scripts.
+        capsule_manifest: Optional precomputed recursive file listing.
         max_iterations: Maximum number of model decisions to execute.
     """
 
@@ -130,7 +130,7 @@ class AgentRunRequest(BaseModel):
 
     question: NonEmptyStr
     capsule_path: Path
-    execution_capsule_path: Path | None = None
+    capsule_manifest: str | None = None
     max_iterations: int = 6
 
     @model_validator(mode="after")

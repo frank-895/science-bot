@@ -14,8 +14,8 @@ class OrchestratorRequest(BaseModel):
 
     Attributes:
         question: User question that should be answered from the capsule.
-        capsule_path: Filesystem path to the extracted capsule directory.
-        execution_capsule_path: Optional container-visible path for prompt usage.
+        capsule_path: Filesystem path used by generated Python scripts.
+        capsule_manifest: Optional precomputed recursive file listing.
         execution_id: Optional identifier used for run artifact scoping.
         trace_writer: Optional trace writer for runtime diagnostics.
     """
@@ -24,7 +24,7 @@ class OrchestratorRequest(BaseModel):
 
     question: str
     capsule_path: Path
-    execution_capsule_path: Path | None = None
+    capsule_manifest: str | None = None
     execution_id: str | None = None
     trace_writer: TraceWriter | None = None
 
@@ -80,15 +80,15 @@ async def run_orchestrator(request: OrchestratorRequest) -> OrchestratorResult:
         OrchestratorResult: Orchestrator output derived from the agent runtime.
 
     Raises:
-        FileNotFoundError: If the capsule path does not exist.
+        FileNotFoundError: If the capsule path does not exist for non-manifest runs.
     """
-    if not request.capsule_path.exists():
+    if request.capsule_manifest is None and not request.capsule_path.exists():
         raise FileNotFoundError(f"Capsule path not found: {request.capsule_path}")
 
     agent_result = await run_agent(
         question=request.question,
         capsule_path=request.capsule_path,
-        execution_capsule_path=request.execution_capsule_path,
+        capsule_manifest=request.capsule_manifest,
         execution_id=request.execution_id,
         trace_writer=request.trace_writer,
     )

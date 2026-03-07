@@ -41,7 +41,7 @@ def test_orchestrator_returns_agent_answer(
         *,
         question: str,
         capsule_path: Path,
-        execution_capsule_path: Path | None = None,
+        capsule_manifest: str | None = None,
         execution_id: str | None = None,
         trace_writer: TraceWriter | None = None,
         max_iterations: int = 6,
@@ -49,7 +49,7 @@ def test_orchestrator_returns_agent_answer(
         del max_iterations
         assert question == "How many rows?"
         assert capsule_path.name == "capsule"
-        assert execution_capsule_path is None
+        assert capsule_manifest is None
         assert execution_id is None
         assert trace_writer is None
         return AgentRunResult(
@@ -84,3 +84,43 @@ def test_orchestrator_returns_agent_answer(
     assert result.metadata["execution_family"] == "agent"
     assert result.metadata["execution_step_count"] == 2
     assert result.metadata["terminal_reason"] is None
+
+
+def test_orchestrator_allows_non_host_capsule_path_when_manifest_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_run_agent(
+        *,
+        question: str,
+        capsule_path: Path,
+        capsule_manifest: str | None = None,
+        execution_id: str | None = None,
+        trace_writer: TraceWriter | None = None,
+        max_iterations: int = 6,
+    ) -> AgentRunResult:
+        del question
+        del capsule_path
+        del execution_id
+        del trace_writer
+        del max_iterations
+        assert capsule_manifest is not None
+        return AgentRunResult(
+            status="completed",
+            answer="ok",
+            iterations_used=1,
+            steps=[AgentStepRecord(iteration=1, decision="respond", answer="ok")],
+            failure_reason=None,
+        )
+
+    monkeypatch.setattr("science_bot.agent.orchestrator.run_agent", fake_run_agent)
+    result = asyncio.run(
+        run_orchestrator(
+            OrchestratorRequest(
+                question="Q",
+                capsule_path=Path("/capsules/row/capsule"),
+                capsule_manifest="/capsules/row/capsule/file.csv",
+            )
+        )
+    )
+
+    assert result.answer == "ok"

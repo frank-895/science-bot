@@ -418,6 +418,40 @@ def to_executor_capsule_path(
     return EXECUTOR_CAPSULES_MOUNT_ROOT / relative
 
 
+def build_capsule_manifest(
+    *,
+    host_capsule_path: Path,
+    prompt_capsule_path: Path,
+    max_entries: int = 200,
+) -> str:
+    """Build a bounded recursive file listing for prompt grounding.
+
+    Args:
+        host_capsule_path: Host-visible path used for filesystem reads.
+        prompt_capsule_path: Path shown in prompts and used by scripts.
+        max_entries: Maximum file entries included.
+
+    Returns:
+        str: Newline-separated manifest text.
+    """
+    if not host_capsule_path.exists():
+        return "(capsule path not found)"
+
+    files = sorted(path for path in host_capsule_path.rglob("*") if path.is_file())
+    if not files:
+        return "(no files found)"
+
+    lines: list[str] = []
+    for file_path in files[:max_entries]:
+        relative_path = file_path.relative_to(host_capsule_path)
+        lines.append(str(prompt_capsule_path / relative_path))
+
+    if len(files) > max_entries:
+        lines.append(f"... ({len(files) - max_entries} more files)")
+
+    return "\n".join(lines)
+
+
 def normalize_text(value: str) -> str:
     """Normalize text for deterministic comparisons.
 
@@ -539,13 +573,17 @@ async def run_benchmark(
                     row,
                     extracted_capsules_root,
                 )
+                execution_capsule_path = to_executor_capsule_path(
+                    capsule_path,
+                    extracted_capsules_root,
+                )
                 orchestrator_result = await run_orchestrator(
                     OrchestratorRequest(
                         question=row.question,
-                        capsule_path=capsule_path,
-                        execution_capsule_path=to_executor_capsule_path(
-                            capsule_path,
-                            extracted_capsules_root,
+                        capsule_path=execution_capsule_path,
+                        capsule_manifest=build_capsule_manifest(
+                            host_capsule_path=capsule_path,
+                            prompt_capsule_path=execution_capsule_path,
                         ),
                         execution_id=row.question_id,
                         trace_writer=row_trace_writer,
