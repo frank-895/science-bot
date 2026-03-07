@@ -178,13 +178,17 @@ async def _run_with_worker(
         dict[str, object]: Structured execution result payload.
     """
     artifact_root = _RUNS_ROOT.resolve()
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    _set_traversable_permissions(artifact_root)
     effective_run_id = run_id or uuid.uuid4().hex
     attempt_id = uuid.uuid4().hex
     attempt_directory = artifact_root / effective_run_id / f"attempt_{attempt_id}"
     attempt_directory.mkdir(parents=True, exist_ok=True)
+    _set_traversable_permissions(attempt_directory)
 
     host_script_path = attempt_directory / "attempt.py"
     host_script_path.write_text(script, encoding="utf-8")
+    _set_readable_permissions(host_script_path)
 
     container_script_path = f"/runs/{effective_run_id}/attempt_{attempt_id}/attempt.py"
     command = [
@@ -247,6 +251,40 @@ async def _run_with_worker(
         duration_ms=duration_ms,
         worker_label=worker_label,
     )
+
+
+def _set_traversable_permissions(path: Path) -> None:
+    """Ensure a path and parents under runs root are traversable by workers.
+
+    Args:
+        path: Directory path created for one execution attempt.
+    """
+    try:
+        current = path
+        root = _RUNS_ROOT.resolve()
+        while True:
+            if not current.exists():
+                break
+            if current.is_dir():
+                current.chmod(0o755)
+            if current == root or current.parent == current:
+                break
+            current = current.parent
+    except OSError:
+        return
+
+
+def _set_readable_permissions(path: Path) -> None:
+    """Ensure a script file is readable by container worker user.
+
+    Args:
+        path: Host script path bound into the runner container.
+    """
+    try:
+        if path.exists() and path.is_file():
+            path.chmod(0o644)
+    except OSError:
+        return
 
 
 def _ensure_ready_and_discover_worker_count() -> int:

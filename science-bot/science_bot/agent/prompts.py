@@ -3,18 +3,23 @@
 from pathlib import Path
 
 DECISION_SCHEMA_TEXT = """Return one JSON object with this schema:
-{"python": "<python code>|null", "final_answer": "<string>|null"}
+{"python": "<python code>"}
 Rules:
-- Provide exactly one of "python" or "final_answer".
-- Use "python" when you need another execution step.
-- Use "final_answer" only when you are ready to answer.
+- Use "python" to explore files, inspect structure,
+  compute statistics, and verify assumptions.
+- In the next turn, each stdout/stderr preview is truncated to 240 chars.
+- Print only relevant diagnostics and final computed values.
+- Do not guess. Do not infer an answer without running Python on capsule data.
+- During exploration, Python scripts do not need to print FINAL_ANSWER.
+- Only print "FINAL_ANSWER: <value>" when you are ready to finish.
+- FINAL_ANSWER must be a single plain value, not a dict/list/JSON object.
 - Extra keys are ignored.
 """
 
 
 REPAIR_PROMPT_TEXT = """Your previous output did not match the required schema.
 Return one JSON object only:
-{"python": "<python code>|null", "final_answer": "<string>|null"}
+{"python": "<python code>"}
 Do not include markdown, prose, or code fences.
 """
 
@@ -32,9 +37,9 @@ def build_system_prompt(max_iterations: int) -> str:
         "You are a life-science data analysis agent.\n"
         "You must answer the question by using short, targeted Python scripts.\n"
         f"You have at most {max_iterations} iterations total.\n"
-        "Start executing quickly, avoid broad exploration, and provide a candidate "
-        "answer as soon as evidence is sufficient.\n"
-        "If you decide to stop or give up, return your best available final_answer.\n"
+        "Start executing quickly and use Python to explore data files "
+        "before answering.\n"
+        "Do not provide a guessed answer.\n"
         "Prefer deterministic scripts and concise outputs.\n"
         f"{DECISION_SCHEMA_TEXT}"
     )

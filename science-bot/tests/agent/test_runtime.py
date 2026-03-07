@@ -11,33 +11,26 @@ from science_bot.providers.llm import LLMResponseFormatError
 from science_bot.tracing import TraceWriter
 
 
-def test_iteration_response_requires_exactly_one_choice() -> None:
+def test_iteration_response_requires_python_field() -> None:
     with pytest.raises(ValidationError):
-        AgentIterationResponse.model_validate(
-            {"python": "print(1)", "final_answer": "42"}
-        )
+        AgentIterationResponse.model_validate({})
 
-    with pytest.raises(ValidationError):
-        AgentIterationResponse.model_validate({"python": None, "final_answer": None})
+    response = AgentIterationResponse.model_validate({"python": "   "})
+    assert response.python_code == "   "
 
 
 def test_iteration_response_ignores_extra_fields() -> None:
     response = AgentIterationResponse.model_validate(
-        {"python": "print(1)", "final_answer": None, "extra": "ignored"}
+        {"python": "print(1)", "extra": "ignored"}
     )
 
     assert response.python_code == "print(1)"
 
 
-def test_run_agent_executes_then_returns_final_answer(
+def test_run_agent_completes_from_python_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = [
-        AgentIterationResponse.model_validate({"python": "print('step1')"}),
-        AgentIterationResponse.model_validate({"final_answer": "42"}),
-    ]
-
-    run_calls = {"count": 0}
+    responses = [AgentIterationResponse.model_validate({"python": "print('x')"})]
 
     async def fake_parse_structured(**_: object) -> AgentIterationResponse:
         return responses.pop(0)
@@ -48,17 +41,15 @@ def test_run_agent_executes_then_returns_final_answer(
         timeout_seconds: int | None = None,
         run_id: str | None = None,
     ) -> PythonExecutionResult:
-        del timeout_seconds
-        run_calls["count"] += 1
-        assert script.startswith("print")
+        del script, timeout_seconds
         assert run_id == "q1-iter-1"
         return PythonExecutionResult(
             status="completed",
-            answer="runtime-value",
+            answer="irrelevant",
             error_type=None,
             error_message=None,
-            stdout_tail="ok stdout",
-            stderr_tail="warn stderr",
+            stdout_tail="noise\nFINAL_ANSWER: 42\n",
+            stderr_tail="",
             duration_ms=5,
             worker="runner-1",
         )
@@ -85,16 +76,13 @@ def test_run_agent_executes_then_returns_final_answer(
 
     assert result.status == "completed"
     assert result.answer == "42"
-    assert result.iterations_used == 2
-    assert len(result.steps) == 2
-    assert run_calls["count"] == 1
+    assert result.iterations_used == 1
+    assert len(result.steps) == 1
     assert result.steps[0].execution_status == "completed"
-    assert result.steps[0].execution_answer == "runtime-value"
-    assert result.steps[1].execution_status is None
-    assert result.steps[1].proposed_final_answer == "42"
+    assert result.steps[0].proposed_final_answer == "42"
 
 
-def test_run_agent_fails_after_budget_without_final_answer(
+def test_run_agent_fails_after_budget_without_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -107,16 +95,14 @@ def test_run_agent_fails_after_budget_without_final_answer(
         timeout_seconds: int | None = None,
         run_id: str | None = None,
     ) -> PythonExecutionResult:
-        del script
-        del timeout_seconds
-        del run_id
+        del script, timeout_seconds, run_id
         return PythonExecutionResult(
-            status="failed",
-            answer=None,
-            error_type="runtime_error",
-            error_message="boom",
-            stdout_tail="",
-            stderr_tail="trace",
+            status="completed",
+            answer="some output",
+            error_type=None,
+            error_message=None,
+            stdout_tail="some output",
+            stderr_tail="",
             duration_ms=10,
             worker="runner-1",
         )
@@ -144,20 +130,15 @@ def test_run_agent_fails_after_budget_without_final_answer(
     assert result.failure_reason == "max_iterations_no_answer"
     assert result.failure_detail is not None
     assert "last_had_python=True" in result.failure_detail
-    assert "last_execution_status=failed" in result.failure_detail
+    assert "last_execution_status=completed" in result.failure_detail
 
 
-def test_run_agent_repairs_invalid_output_once(
+def test_run_agent_fails_on_invalid_output_without_retry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    calls = {"count": 0}
-
     async def fake_parse_structured(**_: object) -> AgentIterationResponse:
-        calls["count"] += 1
-        if calls["count"] == 1:
-            raise LLMResponseFormatError("invalid json")
-        return AgentIterationResponse.model_validate({"final_answer": "42"})
+        raise LLMResponseFormatError("invalid json")
 
     async def fake_run_python(
         script: str,
@@ -165,9 +146,16 @@ def test_run_agent_repairs_invalid_output_once(
         timeout_seconds: int | None = None,
         run_id: str | None = None,
     ) -> PythonExecutionResult:
-        raise AssertionError(
-            "run_python should not be called when final_answer is provided "
-            f"({script}, {timeout_seconds}, {run_id})"
+        del script, timeout_seconds, run_id
+        return PythonExecutionResult(
+            status="completed",
+            answer="",
+            error_type=None,
+            error_message=None,
+            stdout_tail="FINAL_ANSWER: 42",
+            stderr_tail="",
+            duration_ms=2,
+            worker="runner-1",
         )
 
     monkeypatch.setattr(
@@ -189,16 +177,17 @@ def test_run_agent_repairs_invalid_output_once(
         )
     )
 
-    assert calls["count"] == 2
-    assert result.status == "completed"
-    assert result.answer == "42"
+    assert result.status == "failed"
+    assert result.failure_reason == "invalid_decision_output"
+    assert result.failure_detail is not None
+    assert "invalid json" in result.failure_detail
 
 
 def test_run_agent_writes_iteration_trace_events(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    responses = [AgentIterationResponse.model_validate({"final_answer": "done"})]
+    responses = [AgentIterationResponse.model_validate({"python": "print('ok')"})]
 
     async def fake_parse_structured(**_: object) -> AgentIterationResponse:
         return responses.pop(0)
@@ -209,9 +198,16 @@ def test_run_agent_writes_iteration_trace_events(
         timeout_seconds: int | None = None,
         run_id: str | None = None,
     ) -> PythonExecutionResult:
-        raise AssertionError(
-            "run_python should not be called when final_answer is provided "
-            f"({script}, {timeout_seconds}, {run_id})"
+        del script, timeout_seconds, run_id
+        return PythonExecutionResult(
+            status="completed",
+            answer="",
+            error_type=None,
+            error_message=None,
+            stdout_tail="FINAL_ANSWER: done",
+            stderr_tail="",
+            duration_ms=7,
+            worker="runner-1",
         )
 
     monkeypatch.setattr(
@@ -237,11 +233,12 @@ def test_run_agent_writes_iteration_trace_events(
     )
 
     assert result.status == "completed"
+    assert result.answer == "done"
     events = (trace_writer.root_dir / "events.jsonl").read_text(encoding="utf-8")
     assert "agent_iteration_started" in events
     assert "agent_decision" in events
-    assert "agent_execution_result" not in events
-    assert "agent_terminated" in events
+    assert "agent_execution_result" in events
+    assert "completed_from_python_output" in events
 
 
 def test_summarize_steps_includes_execution_output_fields() -> None:

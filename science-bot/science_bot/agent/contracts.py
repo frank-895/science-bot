@@ -16,25 +16,7 @@ class AgentIterationResponse(BaseModel):
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    python_code: str | None = Field(default=None, alias="python")
-    final_answer: str | None = None
-
-    @model_validator(mode="after")
-    def validate_choice(self) -> "AgentIterationResponse":
-        """Require exactly one of python or final answer.
-
-        Returns:
-            AgentIterationResponse: Validated response.
-
-        Raises:
-            ValueError: If required fields are missing.
-        """
-        code = self.python_code.strip() if self.python_code is not None else ""
-        has_code = bool(code)
-        has_answer = self.final_answer is not None
-        if has_code == has_answer:
-            raise ValueError("Provide exactly one of python or final_answer.")
-        return self
+    python_code: str = Field(alias="python")
 
 
 class AgentStepRecord(BaseModel):

@@ -1,5 +1,6 @@
 """Real-mode runtime loop for iterative question answering."""
 
+import json
 import re
 from pathlib import Path
 
@@ -12,7 +13,6 @@ from science_bot.agent.contracts import (
     AgentStepRecord,
 )
 from science_bot.agent.prompts import (
-    build_repair_prompt,
     build_system_prompt,
     build_user_prompt,
 )
@@ -26,6 +26,7 @@ from science_bot.tracing import TraceWriter
 
 DEFAULT_MAX_ITERATIONS = 6
 DEFAULT_PYTHON_TIMEOUT_SECONDS = 30
+FINAL_ANSWER_MARKER = "FINAL_ANSWER:"
 
 
 async def run_agent(
@@ -93,102 +94,42 @@ async def run_agent(
                 trace_writer=trace_writer,
                 trace_stage="agent",
             )
-        except (LLMResponseFormatError, ValidationError) as first_error:
+        except (LLMResponseFormatError, ValidationError) as exc:
+            failure_detail = f"Decision parsing failed: {exc}"
             _write_trace_event(
                 trace_writer=trace_writer,
-                event="agent_repair_attempted",
+                event="agent_terminated",
                 payload={
                     "iteration": iteration,
-                    "error": str(first_error),
+                    "reason": "invalid_decision_output",
+                    "detail": failure_detail,
                 },
             )
-            repair_prompt = build_repair_prompt(previous_error=str(first_error))
-            try:
-                decision = await parse_structured(
-                    system_prompt=system_prompt,
-                    user_prompt=repair_prompt,
-                    response_model=AgentIterationResponse,
-                    trace_writer=trace_writer,
-                    trace_stage="agent",
-                )
-            except (LLMResponseFormatError, ValidationError) as second_error:
-                _write_trace_event(
-                    trace_writer=trace_writer,
-                    event="agent_repair_failed",
-                    payload={
-                        "iteration": iteration,
-                        "first_error": str(first_error),
-                        "second_error": str(second_error),
-                    },
-                )
-                failure_detail = (
-                    "Decision parsing failed after one repair attempt. "
-                    f"first_error={first_error}; second_error={second_error}"
-                )
-                _write_trace_event(
-                    trace_writer=trace_writer,
-                    event="agent_terminated",
-                    payload={
-                        "iteration": iteration,
-                        "reason": "invalid_decision_output",
-                        "detail": failure_detail,
-                    },
-                )
-                return AgentRunResult(
-                    status="failed",
-                    iterations_used=iteration,
-                    steps=steps,
-                    failure_reason="invalid_decision_output",
-                    failure_detail=failure_detail,
-                )
+            return AgentRunResult(
+                status="failed",
+                iterations_used=iteration,
+                steps=steps,
+                failure_reason="invalid_decision_output",
+                failure_detail=failure_detail,
+            )
 
         _write_trace_event(
             trace_writer=trace_writer,
             event="agent_decision",
             payload={
                 "iteration": iteration,
-                "has_python": bool(
-                    decision.python_code and decision.python_code.strip()
-                ),
-                "has_final_answer": decision.final_answer is not None,
+                "has_python": True,
             },
         )
-        if decision.final_answer is not None:
-            final_answer = _stringify_final_answer(decision.final_answer)
-            step = AgentStepRecord(
-                iteration=iteration,
-                script=decision.python_code or "",
-                proposed_final_answer=final_answer,
-            )
-            steps.append(step)
-            _write_trace_event(
-                trace_writer=trace_writer,
-                event="agent_terminated",
-                payload={
-                    "iteration": iteration,
-                    "reason": "completed",
-                    "answer_preview": final_answer[:200] if final_answer else None,
-                },
-            )
-            return AgentRunResult(
-                status="completed",
-                answer=final_answer,
-                iterations_used=iteration,
-                steps=steps,
-                failure_reason=None,
-                failure_detail=None,
-            )
-
         run_id = _build_execution_run_id(execution_id, iteration)
         execution_result = await run_python(
-            decision.python_code or "",
+            decision.python_code,
             timeout_seconds=DEFAULT_PYTHON_TIMEOUT_SECONDS,
             run_id=run_id,
         )
         step = AgentStepRecord(
             iteration=iteration,
-            script=decision.python_code or "",
-            proposed_final_answer=_stringify_final_answer(decision.final_answer),
+            script=decision.python_code,
             execution_status=execution_result.status,
             execution_error=execution_result.error_message,
             execution_answer=execution_result.answer,
@@ -214,18 +155,36 @@ async def run_agent(
                 else None,
             },
         )
+        extracted_answer = _extract_final_answer_marker(
+            execution_result.answer,
+            execution_result.stdout_tail,
+        )
+        if extracted_answer is not None:
+            steps[-1].proposed_final_answer = extracted_answer
+            _write_trace_event(
+                trace_writer=trace_writer,
+                event="agent_terminated",
+                payload={
+                    "iteration": iteration,
+                    "reason": "completed_from_python_output",
+                    "answer_preview": extracted_answer[:200],
+                },
+            )
+            return AgentRunResult(
+                status="completed",
+                answer=extracted_answer,
+                iterations_used=iteration,
+                steps=steps,
+                failure_reason=None,
+                failure_detail=None,
+            )
 
     last_step = steps[-1] if steps else None
     no_answer_detail = (
         f"last_had_python={bool(last_step.script.strip())}; "
-        f"last_execution_status={last_step.execution_status}; "
-        f"had_candidate_answer={last_step.proposed_final_answer is not None}"
+        f"last_execution_status={last_step.execution_status}"
         if last_step is not None
-        else (
-            "last_had_python=None; "
-            "last_execution_status=None; "
-            "had_candidate_answer=False"
-        )
+        else "last_had_python=None; last_execution_status=None"
     )
     _write_trace_event(
         trace_writer=trace_writer,
@@ -294,10 +253,56 @@ def _write_trace_event(
     trace_writer.write_event(event=event, stage="agent", payload=payload)
 
 
-def _stringify_final_answer(value: object | None) -> str | None:
-    """Convert any model-emitted final answer value into string form."""
-    if value is None:
+def _extract_final_answer_marker(
+    answer: str | None,
+    stdout_tail: str | None,
+) -> str | None:
+    """Extract a FINAL_ANSWER marker from execution output.
+
+    Args:
+        answer: Structured execution answer field.
+        stdout_tail: Tail of raw stdout text.
+
+    Returns:
+        str | None: Extracted final answer text if marker is present.
+    """
+    answer_extracted = _extract_marker_from_text(answer)
+    if answer_extracted is not None:
+        return answer_extracted
+
+    if stdout_tail is None:
         return None
-    if isinstance(value, str):
-        return value
-    return str(value)
+
+    # Runner stdout is JSON-encoded. Prefer the parsed "answer" field if present.
+    try:
+        payload = json.loads(stdout_tail)
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        payload_answer = payload.get("answer")
+        if isinstance(payload_answer, str):
+            payload_extracted = _extract_marker_from_text(payload_answer)
+            if payload_extracted is not None:
+                return payload_extracted
+
+    return _extract_marker_from_text(stdout_tail)
+
+
+def _extract_marker_from_text(text: str | None) -> str | None:
+    """Extract FINAL_ANSWER marker from plain text lines.
+
+    Args:
+        text: Candidate plain text.
+
+    Returns:
+        str | None: Marker value if present.
+    """
+    if text is None:
+        return None
+    for line in text.splitlines():
+        if FINAL_ANSWER_MARKER in line:
+            _, _, value = line.partition(FINAL_ANSWER_MARKER)
+            extracted = value.strip()
+            if extracted:
+                return extracted
+    return None
