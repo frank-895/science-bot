@@ -21,8 +21,18 @@ def summarize_steps(steps: list[AgentStepRecord], max_chars: int = 2400) -> str:
         fields = [f"iter={step.iteration}", f"decision={step.decision}"]
         if step.execution_status:
             fields.append(f"exec_status={step.execution_status}")
+        if step.execution_duration_ms is not None:
+            fields.append(f"exec_ms={step.execution_duration_ms}")
+        if step.execution_worker:
+            fields.append(f"exec_worker={step.execution_worker[:40]}")
         if step.execution_error:
-            fields.append(f"exec_error={step.execution_error[:120]}")
+            fields.append(f"exec_error={step.execution_error[:140]}")
+        if step.execution_answer:
+            fields.append(f"exec_answer={step.execution_answer[:200]}")
+        if step.execution_stdout_tail:
+            fields.append(f"exec_stdout={step.execution_stdout_tail[:240]}")
+        if step.execution_stderr_tail:
+            fields.append(f"exec_stderr={step.execution_stderr_tail[:240]}")
         if step.answer:
             fields.append(f"answer={step.answer[:120]}")
         if step.reason:

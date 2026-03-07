@@ -3,7 +3,14 @@
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    TypeAdapter,
+    model_validator,
+)
 
 NonEmptyStr = Annotated[
     str,
@@ -11,44 +18,70 @@ NonEmptyStr = Annotated[
 ]
 
 
-class AgentDecision(BaseModel):
-    """One model decision for an agent iteration."""
+class RunPythonDecision(BaseModel):
+    """Decision variant for executing one Python script."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
+
+    decision: Literal["run_python"]
+    script: NonEmptyStr
+
+
+class RespondDecision(BaseModel):
+    """Decision variant for returning a candidate answer."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    decision: Literal["respond"]
+    answer: NonEmptyStr
+
+
+class NeedInfoDecision(BaseModel):
+    """Decision variant for signaling missing required information."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    decision: Literal["need_info"]
+    reason: NonEmptyStr
+
+
+DecisionPayload = Annotated[
+    RunPythonDecision | RespondDecision | NeedInfoDecision,
+    Field(discriminator="decision"),
+]
+_DECISION_ADAPTER = TypeAdapter(DecisionPayload)
+
+
+class AgentDecision(BaseModel):
+    """Decision model validated by a discriminated union adapter."""
+
+    model_config = ConfigDict(extra="ignore")
 
     decision: Literal["run_python", "respond", "need_info"]
-    script: str | None = None
-    answer: str | None = None
-    reason: str | None = None
+    script: NonEmptyStr | None = None
+    answer: NonEmptyStr | None = None
+    reason: NonEmptyStr | None = None
 
-    @model_validator(mode="after")
-    def validate_fields_for_decision(self) -> "AgentDecision":
-        """Validate required fields for the selected decision.
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_and_validate_payload(cls, data: object) -> object:
+        """Validate through the discriminated union and drop irrelevant keys.
+
+        Args:
+            data: Candidate decision payload.
 
         Returns:
-            AgentDecision: Validated decision.
-
-        Raises:
-            ValueError: If required fields are missing.
+            object: Normalized payload.
         """
-        if self.decision == "run_python":
-            if self.script is None or not self.script.strip():
-                raise ValueError("run_python decisions must include non-empty script.")
-            if self.answer is not None or self.reason is not None:
-                raise ValueError(
-                    "run_python decisions cannot include answer or reason."
-                )
-        if self.decision == "respond":
-            if self.answer is None or not self.answer.strip():
-                raise ValueError("respond decisions must include non-empty answer.")
-            if self.script is not None or self.reason is not None:
-                raise ValueError("respond decisions cannot include script or reason.")
-        if self.decision == "need_info":
-            if self.reason is None or not self.reason.strip():
-                raise ValueError("need_info decisions must include a reason.")
-            if self.script is not None or self.answer is not None:
-                raise ValueError("need_info decisions cannot include script or answer.")
-        return self
+        if not isinstance(data, dict):
+            return data
+
+        payload = _DECISION_ADAPTER.validate_python(data)
+        if isinstance(payload, RunPythonDecision):
+            return {"decision": "run_python", "script": payload.script}
+        if isinstance(payload, RespondDecision):
+            return {"decision": "respond", "answer": payload.answer}
+        return {"decision": "need_info", "reason": payload.reason}
 
 
 class AgentStepRecord(BaseModel):
@@ -63,6 +96,11 @@ class AgentStepRecord(BaseModel):
     answer: str | None = None
     execution_status: str | None = None
     execution_error: str | None = None
+    execution_answer: str | None = None
+    execution_stdout_tail: str | None = None
+    execution_stderr_tail: str | None = None
+    execution_duration_ms: int | None = None
+    execution_worker: str | None = None
 
 
 class AgentRunResult(BaseModel):
@@ -75,6 +113,7 @@ class AgentRunResult(BaseModel):
     iterations_used: int
     steps: list[AgentStepRecord]
     failure_reason: NonEmptyStr | None = None
+    failure_detail: str | None = None
 
 
 class AgentRunRequest(BaseModel):
@@ -83,6 +122,7 @@ class AgentRunRequest(BaseModel):
     Attributes:
         question: User question to answer.
         capsule_path: Filesystem path to the capsule data directory.
+        execution_capsule_path: Optional container-visible path used in prompts.
         max_iterations: Maximum number of model decisions to execute.
     """
 
@@ -90,6 +130,7 @@ class AgentRunRequest(BaseModel):
 
     question: NonEmptyStr
     capsule_path: Path
+    execution_capsule_path: Path | None = None
     max_iterations: int = 6
 
     @model_validator(mode="after")

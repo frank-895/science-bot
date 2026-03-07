@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from science_bot import benchmark
-from science_bot.agent.orchestrator import OrchestratorResult
+from science_bot.agent.orchestrator import OrchestratorRequest, OrchestratorResult
 from science_bot.benchmark import (
     BenchmarkRow,
     BenchmarkSummary,
@@ -17,6 +17,7 @@ from science_bot.benchmark import (
     resolve_benchmark_capsule_path,
     run_benchmark,
     score_benchmark_response,
+    to_executor_capsule_path,
 )
 
 
@@ -41,6 +42,18 @@ def write_benchmark_csv(path: Path, rows: list[dict[str, str]]) -> None:
             ]
         ),
         encoding="utf-8",
+    )
+
+
+@pytest.fixture(autouse=True)
+def isolate_extracted_capsules_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        benchmark,
+        "DEFAULT_EXTRACTED_CAPSULES_ROOT",
+        tmp_path / "extracted_capsules",
     )
 
 
@@ -178,7 +191,7 @@ def test_extract_inner_capsules_creates_extracted_capsule_tree(tmp_path: Path) -
 
     extracted_root = extract_inner_capsules(source_directory)
 
-    assert extracted_root == tmp_path / "extracted_capsules"
+    assert extracted_root == benchmark.DEFAULT_EXTRACTED_CAPSULES_ROOT.resolve()
     assert (extracted_root / "cap-1" / "CapsuleData-inner" / "data.txt").is_file()
     assert not (extracted_root / "cap-1" / "__MACOSX").exists()
 
@@ -193,7 +206,7 @@ def test_extract_inner_capsules_finds_archives_recursively(tmp_path: Path) -> No
 
     extracted_root = extract_inner_capsules(source_directory)
 
-    assert extracted_root == tmp_path / "extracted_capsules"
+    assert extracted_root == benchmark.DEFAULT_EXTRACTED_CAPSULES_ROOT.resolve()
     assert (extracted_root / "cap-1" / "CapsuleData-inner" / "data.txt").is_file()
 
 
@@ -205,14 +218,17 @@ def test_extract_inner_capsules_reuses_existing_data(tmp_path: Path) -> None:
         archive.writestr("CapsuleData-inner/data.txt", "new-payload")
 
     existing_file = (
-        tmp_path / "extracted_capsules" / "cap-1" / "CapsuleData-existing" / "data.txt"
+        benchmark.DEFAULT_EXTRACTED_CAPSULES_ROOT.resolve()
+        / "cap-1"
+        / "CapsuleData-existing"
+        / "data.txt"
     )
     existing_file.parent.mkdir(parents=True)
     existing_file.write_text("existing", encoding="utf-8")
 
     extracted_root = extract_inner_capsules(source_directory)
 
-    assert extracted_root == tmp_path / "extracted_capsules"
+    assert extracted_root == benchmark.DEFAULT_EXTRACTED_CAPSULES_ROOT.resolve()
     assert existing_file.read_text(encoding="utf-8") == "existing"
 
 
@@ -239,7 +255,7 @@ def test_prepare_benchmark_directory_extracts_zip_input(tmp_path: Path) -> None:
 
     prepared_root = prepare_benchmark_directory(outer_zip)
 
-    assert prepared_root == tmp_path / "extracted_capsules"
+    assert prepared_root == benchmark.DEFAULT_EXTRACTED_CAPSULES_ROOT.resolve()
     assert (prepared_root / "cap-1" / "CapsuleData-inner" / "data.txt").is_file()
 
 
@@ -255,8 +271,18 @@ def test_prepare_benchmark_directory_extracts_already_unzipped_outer_directory(
 
     prepared_root = prepare_benchmark_directory(outer_directory)
 
-    assert prepared_root == tmp_path / "extracted_capsules"
+    assert prepared_root == benchmark.DEFAULT_EXTRACTED_CAPSULES_ROOT.resolve()
     assert (prepared_root / "cap-1" / "CapsuleData-inner" / "data.txt").is_file()
+
+
+def test_to_executor_capsule_path_maps_under_mount_root(tmp_path: Path) -> None:
+    extracted_root = tmp_path / "extracted_capsules"
+    capsule_path = extracted_root / "cap-1" / "CapsuleData-inner"
+    mapped = to_executor_capsule_path(capsule_path, extracted_root)
+
+    assert mapped == (
+        benchmark.EXECUTOR_CAPSULES_MOUNT_ROOT / "cap-1" / "CapsuleData-inner"
+    )
 
 
 def test_score_benchmark_response_for_supported_modes() -> None:
@@ -340,7 +366,7 @@ def test_run_benchmark_writes_trace_artifacts(
 ) -> None:
     csv_path = tmp_path / "benchmark.csv"
     extracted_root = tmp_path / "extracted"
-    capsule_path = extracted_root / "row-1" / "CapsuleData-cap-1"
+    capsule_path = extracted_root / "cap-1" / "CapsuleData-cap-1"
     capsule_path.mkdir(parents=True)
     write_benchmark_csv(
         csv_path,
@@ -362,8 +388,10 @@ def test_run_benchmark_writes_trace_artifacts(
         lambda _: extracted_root,
     )
 
-    async def fake_run_orchestrator(request: object) -> OrchestratorResult:
-        del request
+    captured_requests: list[OrchestratorRequest] = []
+
+    async def fake_run_orchestrator(request: OrchestratorRequest) -> OrchestratorResult:
+        captured_requests.append(request)
         return OrchestratorResult(
             question="What is one?",
             capsule_path=capsule_path,
@@ -393,3 +421,6 @@ def test_run_benchmark_writes_trace_artifacts(
     assert (trace_writer.root_dir / "summary.json").is_file()
     assert (trace_writer.root_dir / "q1" / "events.jsonl").is_file()
     assert (trace_writer.root_dir / "q1" / "summary.json").is_file()
+    assert captured_requests
+    assert captured_requests[0].execution_id == "q1"
+    assert captured_requests[0].trace_writer is not None

@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from science_bot.agent.runtime import run_agent
+from science_bot.tracing import TraceWriter
 
 
 class OrchestratorRequest(BaseModel):
@@ -14,12 +15,18 @@ class OrchestratorRequest(BaseModel):
     Attributes:
         question: User question that should be answered from the capsule.
         capsule_path: Filesystem path to the extracted capsule directory.
+        execution_capsule_path: Optional container-visible path for prompt usage.
+        execution_id: Optional identifier used for run artifact scoping.
+        trace_writer: Optional trace writer for runtime diagnostics.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     question: str
     capsule_path: Path
+    execution_capsule_path: Path | None = None
+    execution_id: str | None = None
+    trace_writer: TraceWriter | None = None
 
     @field_validator("question")
     @classmethod
@@ -81,11 +88,21 @@ async def run_orchestrator(request: OrchestratorRequest) -> OrchestratorResult:
     agent_result = await run_agent(
         question=request.question,
         capsule_path=request.capsule_path,
+        execution_capsule_path=request.execution_capsule_path,
+        execution_id=request.execution_id,
+        trace_writer=request.trace_writer,
     )
 
     if agent_result.status != "completed" or agent_result.answer is None:
         terminal_reason = agent_result.failure_reason or "agent_failed"
-        raise RuntimeError(f"Agent failed to produce an answer: {terminal_reason}")
+        terminal_detail = (
+            f"; detail={agent_result.failure_detail}"
+            if agent_result.failure_detail
+            else ""
+        )
+        raise RuntimeError(
+            f"Agent failed to produce an answer: {terminal_reason}{terminal_detail}"
+        )
 
     return OrchestratorResult(
         question=request.question,
@@ -99,6 +116,7 @@ async def run_orchestrator(request: OrchestratorRequest) -> OrchestratorResult:
             "execution_family": "agent",
             "execution_step_count": len(agent_result.steps),
             "terminal_reason": agent_result.failure_reason,
+            "terminal_detail": agent_result.failure_detail,
         },
         error=None,
     )

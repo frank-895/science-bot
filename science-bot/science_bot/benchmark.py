@@ -40,6 +40,8 @@ OPTIONAL_BENCHMARK_COLUMNS = frozenset({"id"})
 BENCHMARK_COLUMNS = REQUIRED_BENCHMARK_COLUMNS | OPTIONAL_BENCHMARK_COLUMNS
 BENCHMARK_CONCURRENCY = 20
 DEFAULT_TRACE_ROOT = Path(".science-bot/traces")
+DEFAULT_EXTRACTED_CAPSULES_ROOT = Path(".science-bot/extracted_capsules")
+EXECUTOR_CAPSULES_MOUNT_ROOT = Path("/capsules")
 NUMERIC_PATTERN = re.compile(r"[-+]?\d*\.?\d+")
 RANGE_PATTERN = re.compile(
     r"^\s*[\(\[]\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*[\)\]]\s*$"
@@ -330,7 +332,7 @@ def extract_inner_capsules(source_directory: Path) -> Path:
     if not source_directory.is_dir():
         raise FileNotFoundError(f"Benchmark directory not found: {source_directory}")
 
-    extracted_root = source_directory.parent / "extracted_capsules"
+    extracted_root = DEFAULT_EXTRACTED_CAPSULES_ROOT.expanduser().resolve()
     extracted_root.mkdir(parents=True, exist_ok=True)
 
     capsule_archives = sorted(source_directory.rglob("CapsuleFolder-*.zip"))
@@ -394,6 +396,26 @@ def prepare_benchmark_directory(directory_path: Path) -> Path:
         "Unsupported benchmark directory. Provide a zip archive, a directory of "
         "CapsuleFolder-*.zip files, or an extracted capsule tree."
     )
+
+
+def to_executor_capsule_path(
+    capsule_path: Path,
+    extracted_capsules_root: Path,
+) -> Path:
+    """Map host capsule path to the container-visible `/capsules` path.
+
+    Args:
+        capsule_path: Host filesystem capsule path.
+        extracted_capsules_root: Host root mounted into runner containers.
+
+    Returns:
+        Path: Container-visible path for scripts.
+    """
+    try:
+        relative = capsule_path.resolve().relative_to(extracted_capsules_root.resolve())
+    except ValueError:
+        return capsule_path
+    return EXECUTOR_CAPSULES_MOUNT_ROOT / relative
 
 
 def normalize_text(value: str) -> str:
@@ -521,6 +543,12 @@ async def run_benchmark(
                     OrchestratorRequest(
                         question=row.question,
                         capsule_path=capsule_path,
+                        execution_capsule_path=to_executor_capsule_path(
+                            capsule_path,
+                            extracted_capsules_root,
+                        ),
+                        execution_id=row.question_id,
+                        trace_writer=row_trace_writer,
                     )
                 )
                 is_correct = score_benchmark_response(

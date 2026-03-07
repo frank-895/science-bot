@@ -8,6 +8,7 @@ from science_bot.agent.orchestrator import (
     OrchestratorRequest,
     run_orchestrator,
 )
+from science_bot.tracing import TraceWriter
 
 
 def test_orchestrator_request_rejects_empty_question(tmp_path: Path) -> None:
@@ -40,11 +41,17 @@ def test_orchestrator_returns_agent_answer(
         *,
         question: str,
         capsule_path: Path,
+        execution_capsule_path: Path | None = None,
+        execution_id: str | None = None,
+        trace_writer: TraceWriter | None = None,
         max_iterations: int = 6,
     ) -> AgentRunResult:
         del max_iterations
         assert question == "How many rows?"
         assert capsule_path.name == "capsule"
+        assert execution_capsule_path is None
+        assert execution_id is None
+        assert trace_writer is None
         return AgentRunResult(
             status="completed",
             answer="42",

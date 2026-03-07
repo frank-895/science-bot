@@ -1,6 +1,9 @@
 """Real-mode runtime loop for iterative question answering."""
 
+import re
 from pathlib import Path
+
+from pydantic import ValidationError
 
 from science_bot.agent.contracts import (
     AgentDecision,
@@ -8,13 +11,18 @@ from science_bot.agent.contracts import (
     AgentRunResult,
     AgentStepRecord,
 )
-from science_bot.agent.prompts import build_system_prompt, build_user_prompt
+from science_bot.agent.prompts import (
+    build_repair_prompt,
+    build_system_prompt,
+    build_user_prompt,
+)
 from science_bot.agent.summary import summarize_steps
 from science_bot.providers.executor import (
     list_available_python_packages,
     run_python,
 )
-from science_bot.providers.llm import parse_structured
+from science_bot.providers.llm import LLMResponseFormatError, parse_structured
+from science_bot.tracing import TraceWriter
 
 DEFAULT_MAX_ITERATIONS = 6
 DEFAULT_PYTHON_TIMEOUT_SECONDS = 30
@@ -24,6 +32,9 @@ async def run_agent(
     *,
     question: str,
     capsule_path: Path,
+    execution_capsule_path: Path | None = None,
+    execution_id: str | None = None,
+    trace_writer: TraceWriter | None = None,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
 ) -> AgentRunResult:
     """Run the real-mode agent loop without oracle correctness feedback.
@@ -31,6 +42,9 @@ async def run_agent(
     Args:
         question: Natural language question to answer.
         capsule_path: Capsule data directory.
+        execution_capsule_path: Container-visible capsule path for scripts.
+        execution_id: Optional question-scoped execution identifier.
+        trace_writer: Optional trace writer for iteration-level diagnostics.
         max_iterations: Maximum number of decision iterations.
 
     Returns:
@@ -42,33 +56,111 @@ async def run_agent(
     request = AgentRunRequest(
         question=question,
         capsule_path=capsule_path,
+        execution_capsule_path=execution_capsule_path,
         max_iterations=max_iterations,
     )
     available_packages = _safe_list_packages()
+    prompt_capsule_path = request.execution_capsule_path or request.capsule_path
+    capsule_manifest = _build_capsule_manifest(
+        host_capsule_path=request.capsule_path,
+        prompt_capsule_path=prompt_capsule_path,
+    )
     steps: list[AgentStepRecord] = []
     latest_candidate_answer: str | None = None
     system_prompt = build_system_prompt(request.max_iterations)
 
     for iteration in range(1, request.max_iterations + 1):
+        remaining = request.max_iterations - iteration + 1
+        _write_trace_event(
+            trace_writer=trace_writer,
+            event="agent_iteration_started",
+            payload={
+                "iteration": iteration,
+                "remaining_budget": remaining,
+                "execution_id": execution_id,
+            },
+        )
         user_prompt = build_user_prompt(
             question=request.question,
-            capsule_path=request.capsule_path,
+            capsule_path=prompt_capsule_path,
+            capsule_manifest=capsule_manifest,
             available_packages=available_packages,
             step_summary=summarize_steps(steps),
             iteration=iteration,
             max_iterations=request.max_iterations,
         )
-        decision = await parse_structured(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            response_model=AgentDecision,
+        try:
+            decision = await parse_structured(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response_model=AgentDecision,
+                trace_writer=trace_writer,
+                trace_stage="agent",
+            )
+        except (LLMResponseFormatError, ValidationError) as first_error:
+            _write_trace_event(
+                trace_writer=trace_writer,
+                event="agent_repair_attempted",
+                payload={
+                    "iteration": iteration,
+                    "error": str(first_error),
+                },
+            )
+            repair_prompt = build_repair_prompt(previous_error=str(first_error))
+            try:
+                decision = await parse_structured(
+                    system_prompt=system_prompt,
+                    user_prompt=repair_prompt,
+                    response_model=AgentDecision,
+                    trace_writer=trace_writer,
+                    trace_stage="agent",
+                )
+            except (LLMResponseFormatError, ValidationError) as second_error:
+                _write_trace_event(
+                    trace_writer=trace_writer,
+                    event="agent_repair_failed",
+                    payload={
+                        "iteration": iteration,
+                        "first_error": str(first_error),
+                        "second_error": str(second_error),
+                    },
+                )
+                failure_detail = (
+                    "Decision parsing failed after one repair attempt. "
+                    f"first_error={first_error}; second_error={second_error}"
+                )
+                _write_trace_event(
+                    trace_writer=trace_writer,
+                    event="agent_terminated",
+                    payload={
+                        "iteration": iteration,
+                        "reason": "invalid_decision_output",
+                        "detail": failure_detail,
+                    },
+                )
+                return AgentRunResult(
+                    status="failed",
+                    iterations_used=iteration,
+                    steps=steps,
+                    failure_reason="invalid_decision_output",
+                    failure_detail=failure_detail,
+                )
+
+        _write_trace_event(
+            trace_writer=trace_writer,
+            event="agent_decision",
+            payload={
+                "iteration": iteration,
+                "decision": decision.decision,
+            },
         )
 
         if decision.decision == "run_python":
+            run_id = _build_execution_run_id(execution_id, iteration)
             execution_result = await run_python(
                 decision.script or "",
                 timeout_seconds=DEFAULT_PYTHON_TIMEOUT_SECONDS,
-                run_id=f"iter-{iteration}",
+                run_id=run_id,
             )
             steps.append(
                 AgentStepRecord(
@@ -77,7 +169,30 @@ async def run_agent(
                     script=decision.script,
                     execution_status=execution_result.status,
                     execution_error=execution_result.error_message,
+                    execution_answer=execution_result.answer,
+                    execution_stdout_tail=execution_result.stdout_tail,
+                    execution_stderr_tail=execution_result.stderr_tail,
+                    execution_duration_ms=execution_result.duration_ms,
+                    execution_worker=execution_result.worker,
                 )
+            )
+            _write_trace_event(
+                trace_writer=trace_writer,
+                event="agent_execution_result",
+                payload={
+                    "iteration": iteration,
+                    "execution_id": execution_id,
+                    "run_id": run_id,
+                    "status": execution_result.status,
+                    "error": execution_result.error_message,
+                    "duration_ms": execution_result.duration_ms,
+                    "worker": execution_result.worker,
+                    "stdout_tail": execution_result.stdout_tail[:240],
+                    "stderr_tail": execution_result.stderr_tail[:240],
+                    "answer": execution_result.answer[:200]
+                    if execution_result.answer
+                    else None,
+                },
             )
             continue
 
@@ -90,6 +205,15 @@ async def run_agent(
                     answer=decision.answer,
                 )
             )
+            _write_trace_event(
+                trace_writer=trace_writer,
+                event="agent_execution_result",
+                payload={
+                    "iteration": iteration,
+                    "status": "responded",
+                    "answer_preview": (decision.answer or "")[:200],
+                },
+            )
             continue
 
         steps.append(
@@ -99,27 +223,67 @@ async def run_agent(
                 reason=decision.reason,
             )
         )
+        _write_trace_event(
+            trace_writer=trace_writer,
+            event="agent_terminated",
+            payload={
+                "iteration": iteration,
+                "reason": "need_info",
+                "detail": decision.reason,
+            },
+        )
         return AgentRunResult(
             status="failed",
             iterations_used=iteration,
             steps=steps,
             failure_reason="need_info",
+            failure_detail=decision.reason,
         )
 
     if latest_candidate_answer is not None:
+        _write_trace_event(
+            trace_writer=trace_writer,
+            event="agent_terminated",
+            payload={
+                "iteration": request.max_iterations,
+                "reason": "completed",
+                "answer_preview": latest_candidate_answer[:200],
+            },
+        )
         return AgentRunResult(
             status="completed",
             answer=latest_candidate_answer,
             iterations_used=request.max_iterations,
             steps=steps,
             failure_reason=None,
+            failure_detail=None,
         )
 
+    last_step = steps[-1] if steps else None
+    no_answer_detail = (
+        f"last_decision={last_step.decision}; "
+        f"last_execution_status={last_step.execution_status}; "
+        f"had_candidate_answer={latest_candidate_answer is not None}"
+        if last_step is not None
+        else (
+            "last_decision=None; last_execution_status=None; had_candidate_answer=False"
+        )
+    )
+    _write_trace_event(
+        trace_writer=trace_writer,
+        event="agent_terminated",
+        payload={
+            "iteration": request.max_iterations,
+            "reason": "max_iterations_no_answer",
+            "detail": no_answer_detail,
+        },
+    )
     return AgentRunResult(
         status="failed",
         iterations_used=request.max_iterations,
         steps=steps,
         failure_reason="max_iterations_no_answer",
+        failure_detail=no_answer_detail,
     )
 
 
@@ -134,3 +298,73 @@ def _safe_list_packages() -> list[str]:
     """
     packages = list_available_python_packages()
     return sorted(packages)
+
+
+def _build_capsule_manifest(
+    *,
+    host_capsule_path: Path,
+    prompt_capsule_path: Path,
+    max_entries: int = 200,
+) -> str:
+    """Build a bounded recursive file manifest for prompt grounding.
+
+    Args:
+        host_capsule_path: Host-visible capsule path used for filesystem reads.
+        prompt_capsule_path: Prompt-visible capsule path used in generated scripts.
+        max_entries: Maximum file paths included.
+
+    Returns:
+        str: Newline-separated manifest string.
+    """
+    if not host_capsule_path.exists():
+        return "(capsule path not found)"
+
+    files = sorted(path for path in host_capsule_path.rglob("*") if path.is_file())
+    if not files:
+        return "(no files found)"
+
+    lines: list[str] = []
+    for file_path in files[:max_entries]:
+        relative_path = file_path.relative_to(host_capsule_path)
+        lines.append(str(prompt_capsule_path / relative_path))
+
+    if len(files) > max_entries:
+        lines.append(f"... ({len(files) - max_entries} more files)")
+
+    return "\n".join(lines)
+
+
+def _build_execution_run_id(execution_id: str | None, iteration: int) -> str:
+    """Build a row-attributed execution run identifier.
+
+    Args:
+        execution_id: Optional identifier tied to one benchmark row.
+        iteration: Current 1-based iteration.
+
+    Returns:
+        str: Stable run identifier used for script artifacts.
+    """
+    if execution_id is None:
+        return f"iter-{iteration}"
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]", "_", execution_id).strip("_")
+    if not cleaned:
+        cleaned = "row"
+    return f"{cleaned}-iter-{iteration}"
+
+
+def _write_trace_event(
+    *,
+    trace_writer: TraceWriter | None,
+    event: str,
+    payload: dict[str, object],
+) -> None:
+    """Write one optional runtime trace event.
+
+    Args:
+        trace_writer: Optional trace writer.
+        event: Stable event name.
+        payload: Event payload mapping.
+    """
+    if trace_writer is None:
+        return
+    trace_writer.write_event(event=event, stage="agent", payload=payload)
