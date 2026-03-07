@@ -1,15 +1,16 @@
-"""Async pipeline orchestrator entrypoint."""
+"""Async orchestrator entrypoint backed by the agent runtime."""
 
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from science_bot.agent.runtime import run_agent
 from science_bot.tracing import TraceWriter
 
 
 class OrchestratorRequest(BaseModel):
-    """Validated request for running the pipeline orchestrator.
+    """Validated request for running the orchestrator.
 
     Attributes:
         question: User question that should be answered from the capsule.
@@ -66,13 +67,13 @@ class OrchestratorResult(BaseModel):
 
 
 async def run_orchestrator(request: OrchestratorRequest) -> OrchestratorResult:
-    """Run a temporary stub orchestrator.
+    """Run the real-mode orchestrator.
 
     Args:
         request: Validated orchestrator request.
 
     Returns:
-        OrchestratorResult: Deterministic placeholder output.
+        OrchestratorResult: Orchestrator output derived from the agent runtime.
 
     Raises:
         FileNotFoundError: If the capsule path does not exist.
@@ -82,23 +83,47 @@ async def run_orchestrator(request: OrchestratorRequest) -> OrchestratorResult:
 
     if request.trace_writer is not None:
         request.trace_writer.write_event(
-            event="orchestrator_stub_used",
+            event="orchestrator_started",
             stage="orchestrator",
             question=request.question,
             payload={"capsule_path": request.capsule_path},
+        )
+
+    agent_result = await run_agent(
+        question=request.question,
+        capsule_path=request.capsule_path,
+        trace_writer=request.trace_writer,
+    )
+
+    if agent_result.status != "completed" or agent_result.answer is None:
+        terminal_reason = agent_result.failure_reason or "agent_failed"
+        raise RuntimeError(f"Agent failed to produce an answer: {terminal_reason}")
+
+    if request.trace_writer is not None:
+        request.trace_writer.write_event(
+            event="orchestrator_finished",
+            stage="orchestrator",
+            question=request.question,
+            payload={
+                "status": agent_result.status,
+                "iterations_used": agent_result.iterations_used,
+                "step_count": len(agent_result.steps),
+                "terminal_reason": agent_result.failure_reason,
+            },
         )
 
     return OrchestratorResult(
         question=request.question,
         capsule_path=request.capsule_path,
         status="completed",
-        answer="ORCHESTRATOR_STUB_RESPONSE",
+        answer=agent_result.answer,
         metadata={
-            "classification_family": "stub",
-            "resolution_iterations_used": 0,
+            "classification_family": "agent",
+            "resolution_iterations_used": agent_result.iterations_used,
             "resolution_selected_files": [],
-            "execution_family": "stub",
-            "execution_notes": ["Stub orchestrator: analysis not yet implemented."],
+            "execution_family": "agent",
+            "execution_step_count": len(agent_result.steps),
+            "terminal_reason": agent_result.failure_reason,
         },
         error=None,
     )

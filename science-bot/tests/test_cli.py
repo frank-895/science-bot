@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from science_bot import cli
+from science_bot.agent.orchestrator import OrchestratorResult
 from science_bot.cli import (
     BenchmarkRow,
     BenchmarkSummary,
@@ -16,7 +17,6 @@ from science_bot.cli import (
     run_benchmark,
     score_benchmark_response,
 )
-from science_bot.pipeline.orchestrator import OrchestratorResult
 
 
 def write_benchmark_csv(path: Path, rows: list[dict[str, str]]) -> None:

@@ -20,7 +20,7 @@ from pydantic import (
     model_validator,
 )
 
-from science_bot.pipeline.orchestrator import OrchestratorRequest, run_orchestrator
+from science_bot.agent.orchestrator import OrchestratorRequest, run_orchestrator
 from science_bot.providers.executor import (
     PythonExecutorUnavailableError,
     ensure_python_executor_ready,
