@@ -72,3 +72,25 @@ def test_run_python_returns_invalid_output_when_runner_stdout_is_not_json(
 
     assert result["status"] == "invalid_output"
     assert result["error_type"] == "invalid_output"
+
+
+def test_parse_compose_ps_json_treats_missing_health_as_empty() -> None:
+    rows = api._parse_compose_ps_json('[{"State":"running","Health":null}]')
+
+    assert rows == [{"State": "running", "Health": ""}]
+
+
+def test_parse_compose_ps_json_supports_newline_delimited_json() -> None:
+    rows = api._parse_compose_ps_json(
+        "\n".join(
+            [
+                '{"State":"running","Health":"healthy"}',
+                '{"State":"running","Health":"healthy"}',
+            ]
+        )
+    )
+
+    assert rows == [
+        {"State": "running", "Health": "healthy"},
+        {"State": "running", "Health": "healthy"},
+    ]

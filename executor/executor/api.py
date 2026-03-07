@@ -7,6 +7,7 @@ import subprocess
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 _DEFAULT_TIMEOUT_SECONDS = 30
 _RUNS_ROOT = Path(".science-bot/runs")
@@ -267,7 +268,7 @@ def _ensure_ready_and_discover_worker_count() -> int:
     if worker_count <= 0:
         raise _ExecutorUnavailableError(
             "Runner workers are not ready. Start them with: "
-            f"docker compose -f {_COMPOSE_FILE} up -d --scale {_SERVICE_NAME}=1"
+            f"docker compose -f {_COMPOSE_FILE} up -d --scale {_SERVICE_NAME}=4"
         )
 
     return worker_count
@@ -334,22 +335,32 @@ def _parse_compose_ps_json(raw: str) -> list[dict[str, str]]:
     Returns:
         list[dict[str, str]]: Parsed service rows.
     """
+    payload: list[object]
     try:
-        payload = json.loads(raw)
+        parsed = json.loads(raw)
+        payload = parsed if isinstance(parsed, list) else [parsed]
     except json.JSONDecodeError:
-        return []
-
-    if not isinstance(payload, list):
-        return []
+        payload = []
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                payload.append(json.loads(stripped))
+            except json.JSONDecodeError:
+                return []
 
     rows: list[dict[str, str]] = []
     for item in payload:
         if not isinstance(item, dict):
             continue
-        state = item.get("State")
-        health = item.get("Health")
-        if isinstance(state, str) and isinstance(health, str):
-            rows.append({"State": state, "Health": health})
+        row = cast(dict[str, object], item)
+        state = row.get("State")
+        health = row.get("Health")
+        if not isinstance(state, str):
+            continue
+        normalized_health = health if isinstance(health, str) else ""
+        rows.append({"State": state, "Health": normalized_health})
     return rows
 
 
