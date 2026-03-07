@@ -304,6 +304,7 @@ def test_build_capsule_manifest_adds_summary_and_prioritizes_tabular(
     tmp_path: Path,
 ) -> None:
     host_capsule = tmp_path / "host" / "CapsuleData-x"
+    host_capsule.mkdir(parents=True)
     (host_capsule / "a.csv").write_text("x\n1\n", encoding="utf-8")
     (host_capsule / "b.xlsx").write_text("placeholder", encoding="utf-8")
     (host_capsule / "c.zip").write_text("placeholder", encoding="utf-8")

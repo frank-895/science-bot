@@ -194,8 +194,6 @@ async def run_agent(
             execution_answer=execution_result.answer,
             execution_stdout_tail=execution_result.stdout_tail,
             execution_stderr_tail=execution_result.stderr_tail,
-            execution_duration_ms=execution_result.duration_ms,
-            execution_worker=execution_result.worker,
         )
         steps.append(step)
         _write_trace_event(

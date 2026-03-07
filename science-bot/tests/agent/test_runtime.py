@@ -254,8 +254,6 @@ def test_summarize_steps_includes_execution_output_fields() -> None:
                 execution_answer="answer-value",
                 execution_stdout_tail="stdout-value",
                 execution_stderr_tail="stderr-value",
-                execution_duration_ms=15,
-                execution_worker="runner-2",
                 proposed_final_answer="candidate",
             )
         ]
@@ -266,6 +264,4 @@ def test_summarize_steps_includes_execution_output_fields() -> None:
     assert "exec_answer=answer-value" in summary
     assert "exec_stdout=stdout-value" in summary
     assert "exec_stderr=stderr-value" in summary
-    assert "exec_ms=15" in summary
-    assert "exec_worker=runner-2" in summary
     assert "proposed_final=candidate" in summary

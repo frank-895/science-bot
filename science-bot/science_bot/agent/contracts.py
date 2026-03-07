@@ -50,8 +50,6 @@ class AgentStepRecord(BaseModel):
     execution_answer: str | None = None
     execution_stdout_tail: str | None = None
     execution_stderr_tail: str | None = None
-    execution_duration_ms: int | None = None
-    execution_worker: str | None = None
 
 
 class AgentRunResult(BaseModel):

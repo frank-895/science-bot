@@ -21,10 +21,6 @@ def summarize_steps(steps: list[AgentStepRecord], max_chars: int = 2400) -> str:
         fields = [f"iter={step.iteration}"]
         if step.execution_status:
             fields.append(f"exec_status={step.execution_status}")
-        if step.execution_duration_ms is not None:
-            fields.append(f"exec_ms={step.execution_duration_ms}")
-        if step.execution_worker:
-            fields.append(f"exec_worker={step.execution_worker[:40]}")
         if step.execution_error:
             fields.append(f"exec_error={step.execution_error[:140]}")
         if step.execution_answer:
